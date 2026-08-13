@@ -113,6 +113,27 @@ class GeneratedSqlResponse(BaseModel):
     explanation: str
 
 
+# Export Schemas
+class ExportRequest(BaseModel):
+    """Input schema for query export.
+
+    ``format`` is intentionally a plain ``str`` rather than a ``Literal``: the
+    accepted set is decided at runtime by ``ExporterRegistry`` (OCP), so a new
+    format can be registered without touching this schema.
+    """
+
+    sql: str = Field(..., min_length=1, description="SQL SELECT query to execute and export")
+    format: str = Field(default="csv", description="Export format (e.g. csv, json, ndjson)")
+    json_style: Literal["document", "array"] = Field(
+        default="document", description="JSON output style (only affects format=json)"
+    )
+    save_history: bool = Field(
+        default=False,
+        description="Whether to record the export run in query history. Defaults to False "
+        "so exports do not pollute the manual query history.",
+    )
+
+
 # Error Schema
 class ErrorResponse(BaseModel):
     """Error response schema."""

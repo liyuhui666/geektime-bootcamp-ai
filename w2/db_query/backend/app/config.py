@@ -9,6 +9,14 @@ class Settings(BaseSettings):
 
     # OpenAI API
     openai_api_key: str
+    # Base URL for OpenAI-compatible services (DeepSeek, Qwen, Zhipu, Moonshot, etc.)
+    # Leave unset (None) to use the official OpenAI endpoint.
+    openai_base_url: str | None = None
+    # Model used for NL2SQL (e.g. gpt-4o-mini, deepseek-chat, qwen-plus, glm-4-flash)
+    openai_model: str = "gpt-4o-mini"
+    # Max tokens for the generated response. Reasoning models (e.g. glm-5.2)
+    # share the budget with thinking tokens, so keep this generous.
+    openai_max_tokens: int = 4096
 
     # Data directory
     db_query_data_dir: str = str(Path.home() / ".db_query")

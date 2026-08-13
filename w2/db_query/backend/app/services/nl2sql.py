@@ -12,9 +12,12 @@ class NaturalLanguageToSQLService:
     """Service for converting natural language queries to SQL using OpenAI."""
 
     def __init__(self):
-        """Initialize OpenAI client."""
-        self.client = AsyncOpenAI(api_key=settings.openai_api_key)
-        self.model = "gpt-4o-mini"  # Cost-effective model for SQL generation
+        """Initialize OpenAI-compatible client."""
+        self.client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+        )
+        self.model = settings.openai_model
 
     def _build_prompt(
         self, user_prompt: str, metadata: dict, db_type: DatabaseType = DatabaseType.POSTGRESQL
@@ -113,7 +116,7 @@ Return ONLY the SQL query, nothing else. No explanations, no markdown, just the 
                 model=self.model,
                 messages=messages,
                 temperature=0.1,  # Low temperature for consistent SQL generation
-                max_tokens=500,
+                max_tokens=settings.openai_max_tokens,
             )
 
             generated_sql = response.choices[0].message.content.strip()

@@ -365,3 +365,87 @@ GET {{baseUrl}}/dbs HTTP/1.1
 ### MySQL 10. Get MySQL Query History
 ###
 GET {{baseUrl}}/dbs/{{mysqlDbName}}/history HTTP/1.1
+
+
+###
+### Data Export Tests
+### One-shot: execute query + export as a downloadable file
+###
+
+### Export 1. List Supported Export Formats
+### Dynamic list sourced from ExporterRegistry (csv, json, ndjson, ...)
+GET {{baseUrl}}/dbs/export/formats HTTP/1.1
+
+### Export 2. Export query result as CSV (one-shot execute + export)
+POST {{baseUrl}}/dbs/{{dbName}}/query/export HTTP/1.1
+Content-Type: application/json
+
+{
+  "sql": "SELECT id, name, email FROM users WHERE status = 'active'",
+  "format": "csv"
+}
+
+### Export 3. Export query result as JSON (document style, default)
+POST {{baseUrl}}/dbs/{{dbName}}/query/export HTTP/1.1
+Content-Type: application/json
+
+{
+  "sql": "SELECT * FROM users LIMIT 100",
+  "format": "json"
+}
+
+### Export 4. Export query result as JSON (array style — rows only)
+POST {{baseUrl}}/dbs/{{dbName}}/query/export HTTP/1.1
+Content-Type: application/json
+
+{
+  "sql": "SELECT * FROM users LIMIT 100",
+  "format": "json",
+  "json_style": "array"
+}
+
+### Export 5. Export query result as NDJSON (one JSON object per line)
+POST {{baseUrl}}/dbs/{{dbName}}/query/export HTTP/1.1
+Content-Type: application/json
+
+{
+  "sql": "SELECT * FROM users",
+  "format": "ndjson"
+}
+
+### Export 6. Export without recording in query history (default behavior)
+POST {{baseUrl}}/dbs/{{dbName}}/query/export HTTP/1.1
+Content-Type: application/json
+
+{
+  "sql": "SELECT * FROM users",
+  "format": "csv",
+  "save_history": false
+}
+
+### Export 7. Error: Non-SELECT statement (should return 400)
+POST {{baseUrl}}/dbs/{{dbName}}/query/export HTTP/1.1
+Content-Type: application/json
+
+{
+  "sql": "DELETE FROM users WHERE id = 1",
+  "format": "csv"
+}
+
+### Export 8. Error: Unsupported format (should return 422)
+POST {{baseUrl}}/dbs/{{dbName}}/query/export HTTP/1.1
+Content-Type: application/json
+
+{
+  "sql": "SELECT 1",
+  "format": "xml"
+}
+
+### Export 9. MySQL — export candidates as CSV
+POST {{baseUrl}}/dbs/{{mysqlDbName}}/query/export HTTP/1.1
+Content-Type: application/json
+
+{
+  "sql": "SELECT id, name, email FROM candidates LIMIT 200",
+  "format": "csv"
+}

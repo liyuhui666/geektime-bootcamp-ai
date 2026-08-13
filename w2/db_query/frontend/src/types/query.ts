@@ -17,6 +17,18 @@ export interface QueryInput {
   sql: string;
 }
 
+/** Supported export formats. Mirrors the backend ExporterRegistry. */
+export type ExportFormat = "csv" | "json" | "ndjson";
+
+export interface ExportRequest {
+  sql: string;
+  format: ExportFormat;
+  /** JSON output style (only affects format=json). */
+  jsonStyle?: "document" | "array";
+  /** Whether to record the export run in query history (defaults to false). */
+  saveHistory?: boolean;
+}
+
 export interface QueryHistoryEntry {
   id: number;
   databaseName: string;

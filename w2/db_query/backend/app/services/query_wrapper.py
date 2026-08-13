@@ -17,6 +17,7 @@ async def execute_query_with_service(
     url: str,
     sql: str,
     query_source: QuerySource = QuerySource.MANUAL,
+    record_history: bool = True,
 ) -> QueryResult:
     """
     Execute SQL query using new database service.
@@ -28,6 +29,9 @@ async def execute_query_with_service(
         url: Database connection URL
         sql: SQL query string
         query_source: Source of the query (manual or natural language)
+        record_history: Whether to persist the run to QueryHistory. Defaults to
+            True to preserve existing query-endpoint behavior. Export callers
+            pass False so exports don't pollute the query history.
 
     Returns:
         QueryResult with columns, rows, and metadata
@@ -49,17 +53,18 @@ async def execute_query_with_service(
         # Convert adapter result to API schema
         columns = [QueryColumn(**col) for col in result.columns]
 
-        # Save successful query to history
-        await save_query_history(
-            session,
-            database_name,
-            sql,
-            result.row_count,
-            execution_time_ms,
-            True,
-            None,
-            query_source,
-        )
+        # Save successful query to history (skipped for exports by default)
+        if record_history:
+            await save_query_history(
+                session,
+                database_name,
+                sql,
+                result.row_count,
+                execution_time_ms,
+                True,
+                None,
+                query_source,
+            )
 
         return QueryResult(
             columns=columns,
@@ -71,28 +76,30 @@ async def execute_query_with_service(
 
     except SqlValidationError as e:
         # Save failed query to history (validation error)
-        await save_query_history(
-            session,
-            database_name,
-            sql,
-            None,
-            None,
-            False,
-            str(e),
-            query_source,
-        )
+        if record_history:
+            await save_query_history(
+                session,
+                database_name,
+                sql,
+                None,
+                None,
+                False,
+                str(e),
+                query_source,
+            )
         raise
 
     except Exception as e:
         # Save failed query to history (execution error)
-        await save_query_history(
-            session,
-            database_name,
-            sql,
-            None,
-            None,
-            False,
-            str(e),
-            query_source,
-        )
+        if record_history:
+            await save_query_history(
+                session,
+                database_name,
+                sql,
+                None,
+                None,
+                False,
+                str(e),
+                query_source,
+            )
         raise

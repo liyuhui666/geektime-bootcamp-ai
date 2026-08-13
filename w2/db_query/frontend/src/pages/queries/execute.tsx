@@ -2,10 +2,24 @@
 
 import React, { useState, useEffect } from "react";
 import { useParams } from "react-router-dom";
-import { Card, Button, Space, Spin, Alert, List, Typography } from "antd";
+import {
+  Card,
+  Button,
+  Space,
+  Spin,
+  Alert,
+  List,
+  Typography,
+  message,
+} from "antd";
 import { PlayCircleOutlined, ReloadOutlined } from "@ant-design/icons";
-import { apiClient } from "../../services/api";
-import { QueryResult, QueryHistoryEntry, QueryInput } from "../../types/query";
+import { apiClient, exportQuery } from "../../services/api";
+import {
+  QueryResult,
+  QueryHistoryEntry,
+  QueryInput,
+  ExportFormat,
+} from "../../types/query";
 import { SqlEditor } from "../../components/SqlEditor";
 import { ResultTable } from "../../components/ResultTable";
 
@@ -19,6 +33,7 @@ export const QueryExecute: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<QueryHistoryEntry[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     if (databaseName) {
@@ -76,6 +91,22 @@ export const QueryExecute: React.FC = () => {
     setResult(null);
   };
 
+  const handleExport = async (format: ExportFormat) => {
+    if (!databaseName || !sql.trim()) {
+      message.warning("Please enter a SQL query");
+      return;
+    }
+    setExporting(true);
+    try {
+      await exportQuery(databaseName, sql.trim(), format);
+      message.success(`Exported as ${format.toUpperCase()}`);
+    } catch (err: any) {
+      message.error(err?.message || "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div style={{ padding: 24 }}>
       <Card
@@ -126,7 +157,11 @@ export const QueryExecute: React.FC = () => {
 
           {result && (
             <Card title="Query Results" size="small">
-              <ResultTable result={result} loading={loading} />
+              <ResultTable
+                result={result}
+                loading={loading || exporting}
+                onExport={handleExport}
+              />
             </Card>
           )}
         </Space>

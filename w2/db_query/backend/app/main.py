@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import init_db
-from app.api.v1 import databases, queries
+from app.api.v1 import databases, exports, queries
 from app.services.db_connection import close_all_connection_pools
 
 # Initialize database
@@ -24,11 +24,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 # Register routers
 app.include_router(databases.router)
 app.include_router(queries.router)
+app.include_router(exports.router)
 
 
 @app.get("/health")

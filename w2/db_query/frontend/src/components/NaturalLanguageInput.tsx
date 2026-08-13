@@ -37,7 +37,7 @@ export const NaturalLanguageInput: React.FC<NaturalLanguageInputProps> = ({
     <Space direction="vertical" style={{ width: "100%" }} size={12}>
       <div>
         <Text strong style={{ fontSize: 13, textTransform: "uppercase" }}>
-          Describe your query in natural language
+          Ask a question, paste SQL, or export
         </Text>
         <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
           (English or Chinese)
@@ -48,8 +48,7 @@ export const NaturalLanguageInput: React.FC<NaturalLanguageInputProps> = ({
         value={prompt}
         onChange={(e) => setPrompt(e.target.value)}
         onKeyDown={handleKeyDown}
-        placeholder="例如：查询所有未完成的任务
-或：Show me all active users from the last 30 days"
+        placeholder={"例如：查询所有未完成的任务\n或直接贴 SQL + 导出指令：\nSELECT * FROM `bigdata`.`mysql_flink1` LIMIT 1000; 导出数据文件为csv格式"}
         rows={4}
         style={{
           fontSize: 15,
@@ -71,7 +70,7 @@ export const NaturalLanguageInput: React.FC<NaturalLanguageInputProps> = ({
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          Press Cmd/Ctrl + Enter to generate
+          Press Cmd/Ctrl + Enter to run · 末尾加「导出为 csv/json/ndjson」可直接出文件
         </Text>
         <Button
           type="primary"
@@ -87,7 +86,7 @@ export const NaturalLanguageInput: React.FC<NaturalLanguageInputProps> = ({
             fontWeight: 700,
           }}
         >
-          GENERATE SQL
+          RUN
         </Button>
       </div>
     </Space>

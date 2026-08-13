@@ -24,6 +24,7 @@ def upgrade() -> None:
         'databaseconnections',
         sa.Column('name', sa.String(length=50), nullable=False),
         sa.Column('url', sa.String(length=500), nullable=False),
+        sa.Column('db_type', sa.String(length=20), nullable=False, server_default='postgresql'),
         sa.Column('description', sa.String(length=200), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=False),
         sa.Column('updated_at', sa.DateTime(), nullable=False),

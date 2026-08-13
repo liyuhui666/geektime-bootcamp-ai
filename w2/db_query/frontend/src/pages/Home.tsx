@@ -14,17 +14,19 @@ import {
   Typography,
   Empty,
   Tabs,
-  Modal,
+  Dropdown,
 } from "antd";
 import {
   PlayCircleOutlined,
   SearchOutlined,
   DatabaseOutlined,
   ReloadOutlined,
-  ExclamationCircleOutlined,
+  DownloadOutlined,
 } from "@ant-design/icons";
-import { apiClient } from "../services/api";
+import { apiClient, exportQuery } from "../services/api";
 import { DatabaseMetadata, TableMetadata } from "../types/metadata";
+import { ExportFormat } from "../types/query";
+import { parseNaturalCommand } from "../utils/parseCommand";
 import { MetadataTree } from "../components/MetadataTree";
 import { SqlEditor } from "../components/SqlEditor";
 import { DatabaseSidebar } from "../components/DatabaseSidebar";
@@ -48,6 +50,7 @@ export const Home: React.FC = () => {
   const [sql, setSql] = useState("SELECT * FROM ");
   const [executing, setExecuting] = useState(false);
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
+  const [exporting, setExporting] = useState(false);
   const [activeTab, setActiveTab] = useState<"manual" | "natural">("manual");
   const [generatingSql, setGeneratingSql] = useState(false);
   const [nlError, setNlError] = useState<string | null>(null);
@@ -75,6 +78,15 @@ export const Home: React.FC = () => {
     }
   };
 
+  const runQuery = async (sqlText: string): Promise<QueryResult> => {
+    const response = await apiClient.post<QueryResult>(
+      `/api/v1/dbs/${selectedDatabase}/query`,
+      { sql: sqlText }
+    );
+    setQueryResult(response.data);
+    return response.data;
+  };
+
   const handleExecuteQuery = async () => {
     if (!selectedDatabase || !sql.trim()) {
       message.warning("Please enter a SQL query");
@@ -83,13 +95,9 @@ export const Home: React.FC = () => {
 
     setExecuting(true);
     try {
-      const response = await apiClient.post<QueryResult>(
-        `/api/v1/dbs/${selectedDatabase}/query`,
-        { sql: sql.trim() }
-      );
-      setQueryResult(response.data);
+      const data = await runQuery(sql.trim());
       message.success(
-        `Query executed - ${response.data.rowCount} rows in ${response.data.executionTimeMs}ms`
+        `Query executed - ${data.rowCount} rows in ${data.executionTimeMs}ms`
       );
     } catch (error: any) {
       message.error(error.response?.data?.detail || "Query execution failed");
@@ -114,21 +122,47 @@ export const Home: React.FC = () => {
     }
   };
 
-  const handleGenerateSQL = async (prompt: string) => {
+  const handleGenerateSQL = async (input: string) => {
     if (!selectedDatabase) return;
 
     setGeneratingSql(true);
     setNlError(null);
     try {
-      const response = await apiClient.post<{ sql: string; explanation: string }>(
-        `/api/v1/dbs/${selectedDatabase}/query/natural`,
-        { prompt }
-      );
-      setSql(response.data.sql);
-      setActiveTab("manual"); // Switch to manual tab to show generated SQL
-      message.success("SQL generated successfully! You can now edit and execute it.");
+      const parsed = parseNaturalCommand(input);
+
+      // 1) Resolve the SQL: use an extracted statement verbatim, otherwise turn
+      //    the (command-stripped) question into SQL via NL2SQL.
+      let sqlText: string;
+      if (parsed.sql) {
+        sqlText = parsed.sql;
+      } else {
+        const response = await apiClient.post<{ sql: string; explanation: string }>(
+          `/api/v1/dbs/${selectedDatabase}/query/natural`,
+          { prompt: parsed.question ?? input }
+        );
+        sqlText = response.data.sql;
+      }
+      setSql(sqlText);
+      setActiveTab("manual");
+
+      // 2) Act: export or just execute. Run the query first so a bad SQL fails
+      //    here (and shows in the result panel) before we attempt to export.
+      const data = await runQuery(sqlText);
+
+      if (parsed.wantsExport) {
+        const format: ExportFormat = parsed.format ?? "csv";
+        await exportQuery(selectedDatabase, sqlText, format);
+        message.success(
+          `导出完成 · ${format.toUpperCase()} · ${data.rowCount} 行`
+        );
+      } else {
+        message.success(
+          `Query executed - ${data.rowCount} rows in ${data.executionTimeMs}ms`
+        );
+      }
     } catch (error: any) {
-      const errorMsg = error.response?.data?.detail || "Failed to generate SQL";
+      const errorMsg =
+        error?.message || error.response?.data?.detail || "Failed";
       setNlError(errorMsg);
       message.error(errorMsg);
     } finally {
@@ -136,89 +170,22 @@ export const Home: React.FC = () => {
     }
   };
 
-  const handleExportCSV = () => {
-    if (!queryResult || queryResult.rows.length === 0) {
-      message.warning("No data to export");
+  const handleExport = async (format: ExportFormat) => {
+    if (!selectedDatabase || !sql.trim()) {
+      message.warning("Please enter a SQL query");
       return;
     }
-
-    // Warn if result is large
-    if (queryResult.rows.length > 10000) {
-      Modal.confirm({
-        title: "Large Dataset Warning",
-        icon: <ExclamationCircleOutlined />,
-        content: `You are about to export ${queryResult.rowCount.toLocaleString()} rows. This may take a while and consume memory. Continue?`,
-        onOk: () => exportToCSV(),
-      });
-    } else {
-      exportToCSV();
+    setExporting(true);
+    try {
+      // Re-runs the SQL server-side so the export shares one serialization
+      // path with CLI/Agent callers (DRY). See FEATURE_EXPORT.md §5.5.
+      await exportQuery(selectedDatabase, sql.trim(), format);
+      message.success(`Exported as ${format.toUpperCase()}`);
+    } catch (err: any) {
+      message.error(err?.message || "Export failed");
+    } finally {
+      setExporting(false);
     }
-  };
-
-  const exportToCSV = () => {
-    if (!queryResult) return;
-
-    // Generate CSV content
-    const headers = queryResult.columns.map((col) => col.name);
-    const csvRows = [headers.join(",")];
-
-    queryResult.rows.forEach((row) => {
-      const values = headers.map((header) => {
-        const value = row[header];
-        // Handle null/undefined
-        if (value === null || value === undefined) return "";
-        // Escape quotes and wrap in quotes if contains comma or quote
-        const stringValue = String(value);
-        if (stringValue.includes(",") || stringValue.includes('"') || stringValue.includes("\n")) {
-          return `"${stringValue.replace(/"/g, '""')}"`;
-        }
-        return stringValue;
-      });
-      csvRows.push(values.join(","));
-    });
-
-    const csvContent = csvRows.join("\n");
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const link = document.createElement("a");
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
-    link.href = URL.createObjectURL(blob);
-    link.download = `${selectedDatabase}_${timestamp}.csv`;
-    link.click();
-    URL.revokeObjectURL(link.href);
-    message.success(`Exported ${queryResult.rowCount} rows to CSV`);
-  };
-
-  const handleExportJSON = () => {
-    if (!queryResult || queryResult.rows.length === 0) {
-      message.warning("No data to export");
-      return;
-    }
-
-    // Warn if result is large
-    if (queryResult.rows.length > 10000) {
-      Modal.confirm({
-        title: "Large Dataset Warning",
-        icon: <ExclamationCircleOutlined />,
-        content: `You are about to export ${queryResult.rowCount.toLocaleString()} rows. This may take a while and consume memory. Continue?`,
-        onOk: () => exportToJSON(),
-      });
-    } else {
-      exportToJSON();
-    }
-  };
-
-  const exportToJSON = () => {
-    if (!queryResult) return;
-
-    const jsonContent = JSON.stringify(queryResult.rows, null, 2);
-    const blob = new Blob([jsonContent], { type: "application/json;charset=utf-8;" });
-    const link = document.createElement("a");
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
-    link.href = URL.createObjectURL(blob);
-    link.download = `${selectedDatabase}_${timestamp}.json`;
-    link.click();
-    URL.revokeObjectURL(link.href);
-    message.success(`Exported ${queryResult.rowCount} rows to JSON`);
   };
 
   const tableColumns =
@@ -623,22 +590,27 @@ export const Home: React.FC = () => {
               </Space>
             }
             extra={
-              <Space size={8}>
+              <Dropdown
+                menu={{
+                  items: [
+                    { key: "csv", label: "CSV" },
+                    { key: "json", label: "JSON" },
+                    { key: "ndjson", label: "NDJSON" },
+                  ],
+                  onClick: ({ key }) => handleExport(key as ExportFormat),
+                }}
+                trigger={["click"]}
+              >
                 <Button
                   size="small"
-                  onClick={handleExportCSV}
+                  icon={<DownloadOutlined />}
+                  loading={exporting}
+                  disabled={!queryResult || queryResult.rowCount === 0}
                   style={{ fontSize: 12, fontWeight: 700 }}
                 >
-                  EXPORT CSV
+                  EXPORT
                 </Button>
-                <Button
-                  size="small"
-                  onClick={handleExportJSON}
-                  style={{ fontSize: 12, fontWeight: 700 }}
-                >
-                  EXPORT JSON
-                </Button>
-              </Space>
+              </Dropdown>
             }
             style={{ borderWidth: 2, borderColor: "#000000" }}
           >

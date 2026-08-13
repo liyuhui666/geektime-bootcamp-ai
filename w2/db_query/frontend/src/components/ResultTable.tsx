@@ -1,17 +1,21 @@
 /** Query result table component with pagination. */
 
 import React, { useState } from "react";
-import { Table, Tag } from "antd";
-import { QueryResult } from "../types/query";
+import { Table, Tag, Button, Dropdown } from "antd";
+import { DownloadOutlined } from "@ant-design/icons";
+import { QueryResult, ExportFormat } from "../types/query";
 
 interface ResultTableProps {
   result: QueryResult | null;
   loading?: boolean;
+  /** Called when the user picks an export format. */
+  onExport?: (format: ExportFormat) => void;
 }
 
 export const ResultTable: React.FC<ResultTableProps> = ({
   result,
   loading = false,
+  onExport,
 }) => {
   const [pagination, setPagination] = useState({
     current: 1,
@@ -47,11 +51,36 @@ export const ResultTable: React.FC<ResultTableProps> = ({
     });
   };
 
+  const exportItems = [
+    { key: "csv", label: "Export as CSV" },
+    { key: "json", label: "Export as JSON" },
+    { key: "ndjson", label: "Export as NDJSON" },
+  ];
+
   return (
     <div>
-      <div style={{ marginBottom: 16 }}>
-        <Tag color="blue">Rows: {result.rowCount}</Tag>
-        <Tag color="green">Execution Time: {result.executionTimeMs}ms</Tag>
+      <div style={{ marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <Tag color="blue">Rows: {result.rowCount}</Tag>
+          <Tag color="green">Execution Time: {result.executionTimeMs}ms</Tag>
+        </div>
+        {onExport && (
+          <Dropdown
+            menu={{
+              items: exportItems,
+              onClick: ({ key }) => onExport(key as ExportFormat),
+            }}
+            trigger={["click"]}
+          >
+            <Button
+              size="small"
+              icon={<DownloadOutlined />}
+              disabled={result.rowCount === 0}
+            >
+              Export
+            </Button>
+          </Dropdown>
+        )}
       </div>
       <Table
         columns={columns}

@@ -19,10 +19,28 @@ from pg_mcp.models.query import (
     QueryRequest,
     ResultValidationResult,
     ReturnType,
+    ValidationResult,
 )
 from pg_mcp.models.schema import ColumnInfo, DatabaseSchema, TableInfo
 from pg_mcp.resilience.circuit_breaker import CircuitState
 from pg_mcp.services.orchestrator import QueryOrchestrator
+from pg_mcp.services.sql_generator import GenerationResult
+
+
+def _gen(sql: str, tokens: int = 100) -> GenerationResult:
+    """Build a GenerationResult like the real SQLGenerator now returns."""
+    return GenerationResult(sql=sql, tokens_used=tokens, model="gpt-4o-mini", latency_ms=1.0)
+
+
+def _valid_validation_result() -> ValidationResult:
+    """Structured validation result matching a passing SQLValidator."""
+    return ValidationResult(
+        is_valid=True,
+        is_select=True,
+        allows_data_modification=False,
+        uses_blocked_functions=[],
+        error_message=None,
+    )
 
 
 class TestDatabaseResolution:
@@ -144,10 +162,11 @@ class TestSQLGenerationWithRetry:
         """Test successful SQL generation on first attempt."""
         # Setup mocks
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT * FROM users;"
+        mock_generator.generate.return_value = _gen("SELECT * FROM users;")
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None  # No exception = valid
+        mock_validator.validate_detail.return_value = _valid_validation_result()
 
         orchestrator = QueryOrchestrator(
             sql_generator=mock_generator,
@@ -182,8 +201,8 @@ class TestSQLGenerationWithRetry:
         # Setup mocks - first attempt fails validation, second succeeds
         mock_generator = AsyncMock()
         mock_generator.generate.side_effect = [
-            "SELECT * FROM user;",  # First attempt (wrong table name)
-            "SELECT * FROM users;",  # Second attempt (correct)
+            _gen("SELECT * FROM user;"),  # First attempt (wrong table name)
+            _gen("SELECT * FROM users;"),  # Second attempt (correct)
         ]
 
         mock_validator = MagicMock()
@@ -192,6 +211,7 @@ class TestSQLGenerationWithRetry:
             SQLParseError('relation "user" does not exist'),
             None,  # Success on second attempt
         ]
+        mock_validator.validate_detail.return_value = _valid_validation_result()
 
         orchestrator = QueryOrchestrator(
             sql_generator=mock_generator,
@@ -227,7 +247,7 @@ class TestSQLGenerationWithRetry:
         """Test failure after exhausting all retries."""
         # Setup mocks - all attempts fail validation
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "DELETE FROM users;"
+        mock_generator.generate.return_value = _gen("DELETE FROM users;")
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.side_effect = SecurityViolationError(
@@ -442,10 +462,11 @@ class TestExecuteQueryFlow:
         """Test executing query with return_type=SQL."""
         # Setup mocks
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT * FROM users;"
+        mock_generator.generate.return_value = _gen("SELECT * FROM users;")
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
+        mock_validator.validate_detail.return_value = _valid_validation_result()
 
         mock_cache = MagicMock()
         mock_cache.get.return_value = mock_schema
@@ -482,10 +503,11 @@ class TestExecuteQueryFlow:
         """Test executing query with return_type=RESULT."""
         # Setup mocks
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT id, name FROM users;"
+        mock_generator.generate.return_value = _gen("SELECT id, name FROM users;")
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
+        mock_validator.validate_detail.return_value = _valid_validation_result()
 
         mock_executor = AsyncMock()
         mock_executor.execute.return_value = (
@@ -551,10 +573,11 @@ class TestExecuteQueryFlow:
         mock_cache.load = AsyncMock(return_value=mock_schema)
 
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT 1;"
+        mock_generator.generate.return_value = _gen("SELECT 1;")
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
+        mock_validator.validate_detail.return_value = _valid_validation_result()
 
         mock_pool = MagicMock()
 
@@ -628,7 +651,7 @@ class TestExecuteQueryFlow:
         mock_cache.get.return_value = mock_schema
 
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "DELETE FROM users;"
+        mock_generator.generate.return_value = _gen("DELETE FROM users;")
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.side_effect = SecurityViolationError("DELETE not allowed")
@@ -666,10 +689,11 @@ class TestExecuteQueryFlow:
         mock_cache.get.return_value = mock_schema
 
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT * FROM users;"
+        mock_generator.generate.return_value = _gen("SELECT * FROM users;")
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
+        mock_validator.validate_detail.return_value = _valid_validation_result()
 
         mock_executor = AsyncMock()
         mock_executor.execute.side_effect = DatabaseError("Query execution failed")
@@ -739,10 +763,11 @@ class TestExecuteQueryFlow:
         mock_cache.get.return_value = mock_schema
 
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT 1;"
+        mock_generator.generate.return_value = _gen("SELECT 1;")
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
+        mock_validator.validate_detail.return_value = _valid_validation_result()
 
         orchestrator = QueryOrchestrator(
             sql_generator=mock_generator,
@@ -767,3 +792,57 @@ class TestExecuteQueryFlow:
         assert response.success is True
         # Verify schema was fetched for auto-selected database
         mock_cache.get.assert_called_once_with("only_db")
+
+
+class TestQuestionLengthLimit:
+    """Tests for the configured question length limit (P1)."""
+
+    def _make_orchestrator(self, **overrides):
+        kwargs: dict = {
+            "sql_generator": MagicMock(),
+            "sql_validator": MagicMock(),
+            "sql_executor": MagicMock(),
+            "result_validator": MagicMock(),
+            "schema_cache": MagicMock(),
+            "pools": {"test_db": MagicMock()},
+            "resilience_config": ResilienceConfig(),
+            "validation_config": ValidationConfig(),
+        }
+        kwargs.update(overrides)
+        return QueryOrchestrator(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_question_exceeding_config_limit_rejected(self) -> None:
+        """Question longer than VALIDATION_MAX_QUESTION_LENGTH fails fast."""
+        orchestrator = self._make_orchestrator(
+            validation_config=ValidationConfig(max_question_length=10)
+        )
+        request = QueryRequest(question="x" * 50, database="test_db")
+        response = await orchestrator.execute_query(request)
+
+        assert response.success is False
+        assert response.error is not None
+        assert response.error.code == "question_too_long"
+        assert response.error.details["max_length"] == 10
+
+    @pytest.mark.asyncio
+    async def test_question_within_config_limit_allowed(self) -> None:
+        """Question within the configured limit proceeds normally."""
+        mock_generator = AsyncMock()
+        mock_generator.generate.return_value = _gen("SELECT 1;")
+        mock_validator = MagicMock()
+        mock_validator.validate_or_raise.return_value = None
+        mock_validator.validate_detail.return_value = _valid_validation_result()
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = MagicMock()
+
+        orchestrator = self._make_orchestrator(
+            sql_generator=mock_generator,
+            sql_validator=mock_validator,
+            schema_cache=mock_cache,
+            validation_config=ValidationConfig(max_question_length=10),
+        )
+        request = QueryRequest(question="short", database="test_db", return_type=ReturnType.SQL)
+        response = await orchestrator.execute_query(request)
+
+        assert response.success is True

@@ -5,10 +5,10 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class DatabaseConfig(BaseSettings):
@@ -50,7 +50,9 @@ class OpenAIConfig(BaseSettings):
 
     api_key: SecretStr = Field(default=SecretStr(""), description="OpenAI API key")
     model: str = Field(default="gpt-4o-mini", description="Model to use for SQL generation")
-    max_tokens: int = Field(default=2000, ge=100, le=4096, description="Maximum tokens in response")
+    max_tokens: int = Field(
+        default=2000, ge=100, le=32768, description="Maximum tokens in response"
+    )
     temperature: float = Field(
         default=0.0, ge=0.0, le=2.0, description="Temperature for response randomness"
     )
@@ -71,14 +73,18 @@ class OpenAIConfig(BaseSettings):
 
 
 class SecurityConfig(BaseSettings):
-    """Security and access control configuration."""
+    """Security and access control configuration.
+
+    Note: this server is read-only by hard constraint (see SQLValidator).
+    There is deliberately no "allow write operations" switch.
+    """
 
     model_config = SettingsConfigDict(env_prefix="SECURITY_")
 
-    allow_write_operations: bool = Field(
-        default=False, description="Allow write operations (INSERT, UPDATE, DELETE)"
-    )
-    blocked_functions: list[str] = Field(
+    # NoDecode: pydantic-settings would otherwise JSON-decode list-typed env
+    # values, so the documented comma-separated format in .env.example would
+    # crash startup. The before-validator below handles both formats.
+    blocked_functions: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: [
             "pg_sleep",
             "pg_read_file",
@@ -115,9 +121,6 @@ class ValidationConfig(BaseSettings):
 
     max_question_length: int = Field(
         default=10000, ge=1, le=50000, description="Maximum question length in characters"
-    )
-    min_confidence_score: int = Field(
-        default=70, ge=0, le=100, description="Minimum confidence score (0-100)"
     )
 
     # Result validation settings
@@ -177,7 +180,7 @@ class ObservabilityConfig(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Logging level"
     )
-    log_format: Literal["json", "text"] = Field(default="text", description="Log format")
+    log_format: Literal["json", "text"] = Field(default="json", description="Log format")
 
 
 class Settings(BaseSettings):

@@ -39,7 +39,7 @@ Open the configuration file in your text editor and add the PostgreSQL MCP serve
         "/absolute/path/to/pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "localhost",
@@ -60,7 +60,7 @@ Open the configuration file in your text editor and add the PostgreSQL MCP serve
   "mcpServers": {
     "postgres": {
       "command": "/absolute/path/to/pg-mcp/.venv/bin/python",
-      "args": ["main.py"],
+      "args": ["-m", "pg_mcp"],
       "cwd": "/absolute/path/to/pg-mcp",
       "env": {
         "DATABASE_HOST": "localhost",
@@ -81,7 +81,7 @@ Open the configuration file in your text editor and add the PostgreSQL MCP serve
   "mcpServers": {
     "postgres": {
       "command": "python3",
-      "args": ["main.py"],
+      "args": ["-m", "pg_mcp"],
       "cwd": "/absolute/path/to/pg-mcp",
       "env": {
         "DATABASE_HOST": "localhost",
@@ -116,7 +116,7 @@ You can add any of these optional parameters to customize behavior:
   "mcpServers": {
     "postgres": {
       "command": "uv",
-      "args": ["--directory", "/path/to/pg-mcp", "run", "python", "main.py"],
+      "args": ["--directory", "/path/to/pg-mcp", "run", "python", "-m", "pg_mcp"],
       "env": {
         "DATABASE_HOST": "localhost",
         "DATABASE_PORT": "5432",
@@ -133,7 +133,6 @@ You can add any of these optional parameters to customize behavior:
         "OPENAI_MAX_TOKENS": "32000",
         "OPENAI_TEMPERATURE": "0.0",
 
-        "SECURITY_ALLOW_WRITE_OPERATIONS": "false",
         "SECURITY_MAX_ROWS": "10000",
         "SECURITY_MAX_EXECUTION_TIME": "30",
 
@@ -183,7 +182,7 @@ If configured correctly, Claude will use the PostgreSQL MCP server to answer the
         "/Users/yourname/projects/pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "localhost",
@@ -211,7 +210,7 @@ If configured correctly, Claude will use the PostgreSQL MCP server to answer the
         "C:\\Users\\YourName\\projects\\pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "localhost",
@@ -239,7 +238,7 @@ If configured correctly, Claude will use the PostgreSQL MCP server to answer the
         "/home/yourname/projects/pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "localhost",
@@ -269,15 +268,14 @@ You can configure multiple database connections by adding additional MCP server 
         "/path/to/pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "prod-db.example.com",
         "DATABASE_NAME": "production",
         "DATABASE_USER": "readonly",
         "DATABASE_PASSWORD": "prod-password",
-        "OPENAI_API_KEY": "sk-...",
-        "SECURITY_ALLOW_WRITE_OPERATIONS": "false"
+        "OPENAI_API_KEY": "sk-..."
       }
     },
     "postgres-development": {
@@ -287,15 +285,14 @@ You can configure multiple database connections by adding additional MCP server 
         "/path/to/pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "localhost",
         "DATABASE_NAME": "development",
         "DATABASE_USER": "dev",
         "DATABASE_PASSWORD": "dev-password",
-        "OPENAI_API_KEY": "sk-...",
-        "SECURITY_ALLOW_WRITE_OPERATIONS": "false"
+        "OPENAI_API_KEY": "sk-..."
       }
     }
   }
@@ -321,7 +318,7 @@ You can configure multiple database connections by adding additional MCP server 
 3. **Test Manually**: Run the server manually to check for errors:
    ```bash
    cd /path/to/pg-mcp
-   uv run python main.py
+   uv run python -m pg_mcp
    ```
 
 ### Database Connection Fails
@@ -385,7 +382,7 @@ You can configure multiple database connections by adding additional MCP server 
 1. **Read-Only User**: Always use a read-only database user
 2. **Secure Passwords**: Use strong, unique passwords
 3. **Network Isolation**: Restrict database access by IP/network
-4. **Write Operations**: Keep `SECURITY_ALLOW_WRITE_OPERATIONS=false`
+4. **Read-Only Server**: SQL validation is read-only by hard constraint (no write switch exists)
 5. **Monitor Usage**: Enable metrics and monitor for unusual activity
 
 ## Advanced Configuration
@@ -402,7 +399,7 @@ Instead of putting all configuration in `claude_desktop_config.json`, you can us
       "command": "bash",
       "args": [
         "-c",
-        "cd /path/to/pg-mcp && source .env && uv run python main.py"
+        "cd /path/to/pg-mcp && source .env && uv run python -m pg_mcp"
       ]
     }
   }
@@ -427,7 +424,7 @@ If PostgreSQL is running on a non-standard port:
   "mcpServers": {
     "postgres": {
       "command": "uv",
-      "args": ["--directory", "/path/to/pg-mcp", "run", "python", "main.py"],
+      "args": ["--directory", "/path/to/pg-mcp", "run", "python", "-m", "pg_mcp"],
       "env": {
         "DATABASE_HOST": "localhost",
         "DATABASE_PORT": "5433",
@@ -448,15 +445,14 @@ To connect to a remote PostgreSQL server:
   "mcpServers": {
     "postgres": {
       "command": "uv",
-      "args": ["--directory", "/path/to/pg-mcp", "run", "python", "main.py"],
+      "args": ["--directory", "/path/to/pg-mcp", "run", "python", "-m", "pg_mcp"],
       "env": {
         "DATABASE_HOST": "db.example.com",
         "DATABASE_PORT": "5432",
         "DATABASE_NAME": "production",
         "DATABASE_USER": "readonly_user",
         "DATABASE_PASSWORD": "secure_password",
-        "OPENAI_API_KEY": "sk-...",
-        "SECURITY_ALLOW_WRITE_OPERATIONS": "false"
+        "OPENAI_API_KEY": "sk-..."
       }
     }
   }

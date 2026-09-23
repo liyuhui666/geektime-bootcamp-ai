@@ -154,7 +154,7 @@ class TestRejectedStatements:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for testing rejected statements."""
-        config = SecurityConfig(allow_write_operations=False)
+        config = SecurityConfig()
         return SQLValidator(config=config)
 
     def test_insert_rejected(self, validator: SQLValidator) -> None:
@@ -659,3 +659,42 @@ class TestSubqueryWithForbiddenOperations:
         is_valid, error = validator.validate(sql)
         assert is_valid
         assert error is None
+
+
+class TestValidateDetail:
+    """Tests for the non-raising validate_detail wrapper (P1)."""
+
+    @pytest.fixture
+    def validator(self) -> SQLValidator:
+        return SQLValidator(config=SecurityConfig())
+
+    def test_valid_sql_returns_success_detail(self, validator: SQLValidator) -> None:
+        result = validator.validate_detail("SELECT * FROM users")
+        assert result.is_valid is True
+        assert result.is_select is True
+        assert result.allows_data_modification is False
+        assert result.uses_blocked_functions == []
+        assert result.error_message is None
+        assert result.is_safe is True
+
+    def test_blocked_function_captured_in_detail(self, validator: SQLValidator) -> None:
+        result = validator.validate_detail("SELECT pg_sleep(10)")
+        assert result.is_valid is False
+        assert "pg_sleep" in result.uses_blocked_functions
+        assert result.error_message is not None
+
+    def test_write_statement_detail(self, validator: SQLValidator) -> None:
+        result = validator.validate_detail("DELETE FROM users")
+        assert result.is_valid is False
+        assert result.is_safe is False
+        assert result.uses_blocked_functions == []
+
+    def test_parse_error_detail(self, validator: SQLValidator) -> None:
+        result = validator.validate_detail("SELEC * FORM users")
+        assert result.is_valid is False
+        assert result.error_message is not None
+
+    def test_empty_sql_detail(self, validator: SQLValidator) -> None:
+        result = validator.validate_detail("   ")
+        assert result.is_valid is False
+        assert result.error_message is not None

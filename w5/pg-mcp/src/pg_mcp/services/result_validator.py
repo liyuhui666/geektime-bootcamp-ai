@@ -116,6 +116,8 @@ class ResultValidator:
             row_count=row_count,
         )
 
+        tokens_used = 0
+
         try:
             # Call OpenAI API with structured JSON output
             response: ChatCompletion = await self.client.chat.completions.create(
@@ -128,6 +130,10 @@ class ResultValidator:
                 temperature=0.0,  # Use deterministic output for validation
                 response_format={"type": "json_object"},  # Ensure JSON response
             )
+
+            # Capture usage so token accounting covers validation calls too
+            usage = getattr(response, "usage", None)
+            tokens_used = getattr(usage, "total_tokens", 0) if usage is not None else 0
 
             # Extract and parse the response
             if not response.choices:
@@ -153,6 +159,7 @@ class ResultValidator:
                     explanation=f"Validation response parsing failed: {e!s}",
                     suggestion="Unable to parse LLM response, manual verification recommended",
                     is_acceptable=False,
+                    tokens_used=tokens_used,
                 )
 
             # Extract fields from response
@@ -176,6 +183,7 @@ class ResultValidator:
                 explanation=explanation,
                 suggestion=suggestion,
                 is_acceptable=is_acceptable,
+                tokens_used=tokens_used,
             )
 
         except TimeoutError as e:
@@ -207,6 +215,7 @@ class ResultValidator:
                 raise LLMUnavailableError(
                     message="OpenAI API rate limit exceeded",
                     details={"error": error_msg},
+                    retryable=True,
                 ) from e
             raise LLMError(
                 message=f"Result validation failed: {error_msg}",

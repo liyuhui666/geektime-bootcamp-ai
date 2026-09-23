@@ -5,18 +5,44 @@ natural language questions into valid PostgreSQL SQL queries.
 """
 
 import re
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI
 
 from pg_mcp.config.settings import OpenAIConfig
-from pg_mcp.models.errors import LLMError, LLMTimeoutError, LLMUnavailableError
+from pg_mcp.models.errors import (
+    LLMError,
+    LLMResponseError,
+    LLMTimeoutError,
+    LLMUnavailableError,
+)
 from pg_mcp.prompts.sql_generation import SQL_GENERATION_SYSTEM_PROMPT, build_user_prompt
 
 if TYPE_CHECKING:
     from openai.types.chat import ChatCompletion
 
     from pg_mcp.models.schema import DatabaseSchema
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    """Structured result of one LLM SQL generation call.
+
+    Attributes:
+        sql: Generated SQL query (with trailing semicolon, matching the
+            previous string-returning contract).
+        tokens_used: Total tokens reported by the API for this call (0 if
+            the API omitted usage information).
+        model: Model name that produced the SQL.
+        latency_ms: Wall-clock duration of the API call in milliseconds.
+    """
+
+    sql: str
+    tokens_used: int = 0
+    model: str = ""
+    latency_ms: float = 0.0
 
 
 class SQLGenerator:
@@ -51,7 +77,7 @@ class SQLGenerator:
         context: str | None = None,
         previous_attempt: str | None = None,
         error_feedback: str | None = None,
-    ) -> str:
+    ) -> GenerationResult:
         """Generate SQL statement from natural language question.
 
         This method sends the question and database schema to OpenAI's API
@@ -66,21 +92,26 @@ class SQLGenerator:
             error_feedback: Error message from previous attempt (for retry).
 
         Returns:
-            str: Generated SQL query (without trailing semicolon).
+            GenerationResult: Generated SQL with usage metadata (tokens,
+                model, latency).
 
         Raises:
-            LLMError: If generation fails or response is invalid.
+            LLMError: If the API request fails.
+            LLMResponseError: If the response is empty or SQL cannot be
+                extracted (routed to feedback retry, not backoff retry).
             LLMTimeoutError: If the API request times out.
             LLMUnavailableError: If the API is unavailable or authentication fails.
 
         Example:
             >>> # Initial generation
-            >>> sql = await generator.generate(
+            >>> result = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema
             ... )
+            >>> result.sql
+            'SELECT COUNT(*) FROM users WHERE active = true;'
             >>> # Retry with error feedback
-            >>> sql = await generator.generate(
+            >>> result = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema,
             ...     previous_attempt="SELECT COUNT(*) FROM user",
@@ -94,6 +125,8 @@ class SQLGenerator:
             previous_attempt=previous_attempt,
             error_feedback=error_feedback,
         )
+
+        started_at = time.perf_counter()
 
         try:
             response: ChatCompletion = await self.client.chat.completions.create(
@@ -122,34 +155,49 @@ class SQLGenerator:
                 raise LLMUnavailableError(
                     message="OpenAI API rate limit exceeded",
                     details={"error": error_msg},
+                    retryable=True,
                 ) from e
             raise LLMError(
                 message=f"OpenAI API request failed: {error_msg}",
                 details={"error": error_msg},
             ) from e
 
-        # Extract SQL from response
+        # Capture usage metadata before any content checks so token counts
+        # survive even when SQL extraction ultimately fails.
+        usage = getattr(response, "usage", None)
+        tokens_used = getattr(usage, "total_tokens", 0) if usage is not None else 0
+
+        # Empty/unparseable responses are content defects, not transient API
+        # failures: at temperature 0 a blind retry would return the same
+        # output, so surface LLMResponseError for the orchestrator's
+        # feedback-retry channel instead of the backoff-retry LLMError path.
         if not response.choices:
-            raise LLMError(
+            raise LLMResponseError(
                 message="OpenAI returned empty response",
                 details={"response": response.model_dump()},
             )
 
         content = response.choices[0].message.content
         if not content:
-            raise LLMError(
+            raise LLMResponseError(
                 message="OpenAI returned empty message content",
                 details={"response": response.model_dump()},
             )
 
         sql = self._extract_sql(content)
         if not sql:
-            raise LLMError(
+            raise LLMResponseError(
                 message="Failed to extract SQL from OpenAI response",
                 details={"content": content},
             )
 
-        return sql
+        latency_ms = (time.perf_counter() - started_at) * 1000
+        return GenerationResult(
+            sql=sql,
+            tokens_used=tokens_used,
+            model=self.config.model,
+            latency_ms=latency_ms,
+        )
 
     def _extract_sql(self, content: str) -> str | None:
         """Extract SQL query from LLM response content.

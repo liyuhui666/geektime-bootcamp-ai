@@ -133,6 +133,19 @@ class ValidationError(PgMcpError):
         super().__init__(message=message, code=ErrorCode.VALIDATION_FAILED, details=details)
 
 
+class QuestionTooLongError(PgMcpError):
+    """Exception raised when the question exceeds the configured length limit."""
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        """Initialize question-too-long error.
+
+        Args:
+            message: Error message describing the limit violation.
+            details: Optional details (e.g. configured limit).
+        """
+        super().__init__(message=message, code=ErrorCode.QUESTION_TOO_LONG, details=details)
+
+
 class SecurityViolationError(PgMcpError):
     """Exception raised when security constraints are violated.
 
@@ -233,14 +246,40 @@ class LLMUnavailableError(LLMError):
     - Service temporarily down
     """
 
-    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        details: dict[str, Any] | None = None,
+        retryable: bool = False,
+    ) -> None:
         """Initialize LLM unavailable error.
 
         Args:
             message: Error message describing unavailability.
             details: Optional unavailability details.
+            retryable: Whether retrying with backoff may succeed
+                (True for rate limits, False for auth failures).
         """
         super().__init__(message=message, code=ErrorCode.LLM_UNAVAILABLE, details=details)
+        self.retryable = retryable
+
+
+class LLMResponseError(LLMError):
+    """Exception raised when the LLM response is empty or unparseable.
+
+    Unlike transient API errors, retrying without feedback is pointless at
+    temperature 0 (the output would be identical), so callers should treat
+    this as a content-level failure and retry through the feedback channel.
+    """
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        """Initialize LLM response error.
+
+        Args:
+            message: Error message describing the unparseable response.
+            details: Optional details (e.g. raw content excerpt).
+        """
+        super().__init__(message=message, code=ErrorCode.LLM_ERROR, details=details)
 
 
 class SchemaLoadError(PgMcpError):

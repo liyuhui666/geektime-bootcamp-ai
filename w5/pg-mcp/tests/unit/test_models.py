@@ -11,13 +11,22 @@ from pg_mcp.models.errors import (
     DatabaseError,
     ErrorCode,
     ErrorDetail,
+    LLMError,
+    LLMResponseError,
     LLMTimeoutError,
     LLMUnavailableError,
     PgMcpError,
+    QuestionTooLongError,
     SecurityViolationError,
     SQLParseError,
 )
-from pg_mcp.models.query import QueryRequest, QueryResponse, QueryResult, ReturnType
+from pg_mcp.models.query import (
+    QueryRequest,
+    QueryResponse,
+    QueryResult,
+    ResultValidationResult,
+    ReturnType,
+)
 from pg_mcp.models.schema import (
     ColumnInfo,
     DatabaseSchema,
@@ -443,3 +452,63 @@ class TestErrorModels:
         assert detail.code == ErrorCode.SECURITY_VIOLATION
         assert detail.message == "Blocked function"
         assert detail.details["function"] == "pg_sleep"
+
+
+class TestQueryResponseToDictContract:
+    """Contract tests for the single QueryResponse.to_dict definition (P1)."""
+
+    def test_to_dict_excludes_none_fields(self) -> None:
+        """None fields are absent; no duplicate-key ambiguity remains."""
+        response = QueryResponse(
+            success=True,
+            generated_sql="SELECT 1",
+            confidence=100,
+            tokens_used=150,
+        )
+        d = response.to_dict()
+        assert d["tokens_used"] == 150
+        assert "error" not in d
+        assert "data" not in d
+        assert "validation" not in d
+
+    def test_to_dict_tokens_used_zero_when_no_llm_call(self) -> None:
+        """Error paths carry tokens_used=None; contract guarantees key present as 0."""
+        from pg_mcp.models.query import ErrorDetail as QueryErrorDetail
+
+        response = QueryResponse(
+            success=False,
+            error=QueryErrorDetail(code="llm_error", message="boom"),
+        )
+        d = response.to_dict()
+        assert d["tokens_used"] == 0
+
+    def test_result_validation_tokens_used_default(self) -> None:
+        """ResultValidationResult carries token usage with 0 default."""
+        r = ResultValidationResult(confidence=90, explanation="ok", is_acceptable=True)
+        assert r.tokens_used == 0
+        r2 = ResultValidationResult(
+            confidence=90, explanation="ok", is_acceptable=True, tokens_used=42
+        )
+        assert r2.tokens_used == 42
+
+
+class TestNewErrorTypes:
+    """Tests for error types added in P1."""
+
+    def test_llm_response_error_is_llm_error(self) -> None:
+        """LLMResponseError subclasses LLMError so existing handlers still catch it."""
+        err = LLMResponseError(message="empty response")
+        assert isinstance(err, LLMError)
+        assert err.code == ErrorCode.LLM_ERROR
+
+    def test_llm_unavailable_retryable_flag(self) -> None:
+        """Retryable flag distinguishes rate limits from auth failures."""
+        rate_limited = LLMUnavailableError(message="rate limited", retryable=True)
+        assert rate_limited.retryable is True
+        auth_failed = LLMUnavailableError(message="auth failed")
+        assert auth_failed.retryable is False
+
+    def test_question_too_long_error(self) -> None:
+        """QuestionTooLongError carries the dedicated error code."""
+        err = QuestionTooLongError(message="too long", details={"max_length": 10})
+        assert err.code == ErrorCode.QUESTION_TOO_LONG

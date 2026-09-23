@@ -284,6 +284,7 @@ class TestSQLGenerator:
         mock_response.choices = [
             MagicMock(message=MagicMock(content="```sql\nSELECT * FROM users;\n```"))
         ]
+        mock_response.usage = MagicMock(total_tokens=150)
 
         # Use AsyncMock for async method
         with patch.object(
@@ -301,8 +302,11 @@ class TestSQLGenerator:
             assert call_kwargs["messages"][0]["role"] == "system"
             assert call_kwargs["messages"][1]["role"] == "user"
 
-            # Verify result
-            assert result == "SELECT * FROM users;"
+            # Verify result (structured: SQL + usage metadata)
+            assert result.sql == "SELECT * FROM users;"
+            assert result.tokens_used == 150
+            assert result.model == "gpt-4o-mini"
+            assert result.latency_ms >= 0
 
     @pytest.mark.asyncio
     async def test_generate_with_context(
@@ -317,6 +321,7 @@ class TestSQLGenerator:
                 )
             )
         ]
+        mock_response.usage = MagicMock(total_tokens=120)
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -327,8 +332,9 @@ class TestSQLGenerator:
                 context="Only count users with status='active'",
             )
 
-            assert "SELECT COUNT(*)" in result
-            assert result.endswith(";")
+            assert "SELECT COUNT(*)" in result.sql
+            assert result.sql.endswith(";")
+            assert result.tokens_used == 120
 
     @pytest.mark.asyncio
     async def test_generate_with_retry_context(
@@ -339,6 +345,7 @@ class TestSQLGenerator:
         mock_response.choices = [
             MagicMock(message=MagicMock(content="```sql\nSELECT COUNT(*) FROM users;\n```"))
         ]
+        mock_response.usage = MagicMock(total_tokens=130)
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -356,7 +363,7 @@ class TestSQLGenerator:
             assert "SELECT COUNT(*) FROM user" in user_prompt
             assert 'relation "user" does not exist' in user_prompt
 
-            assert result == "SELECT COUNT(*) FROM users;"
+            assert result.sql == "SELECT COUNT(*) FROM users;"
 
     @pytest.mark.asyncio
     async def test_generate_handles_llm_timeout(
@@ -473,6 +480,7 @@ LIMIT 10;"""
 
         mock_response = MagicMock()
         mock_response.choices = [MagicMock(message=MagicMock(content=f"```sql\n{cte_sql}\n```"))]
+        mock_response.usage = MagicMock(total_tokens=200)
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -481,8 +489,9 @@ LIMIT 10;"""
                 "Show top 10 users by order count in last 30 days", mock_schema
             )
 
-            assert result.startswith("WITH recent_orders")
-            assert "LIMIT 10;" in result
+            assert result.sql.startswith("WITH recent_orders")
+            assert "LIMIT 10;" in result.sql
+            assert result.tokens_used == 200
 
     @pytest.mark.asyncio
     async def test_generate_respects_config_settings(self, mock_schema: DatabaseSchema) -> None:

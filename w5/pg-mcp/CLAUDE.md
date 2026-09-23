@@ -474,7 +474,7 @@ exclude_lines = [
 uv sync
 
 # 运行服务
-uv run python main.py
+uv run python -m pg_mcp
 
 # 运行测试
 uv run pytest

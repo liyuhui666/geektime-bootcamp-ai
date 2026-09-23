@@ -34,7 +34,6 @@ RUN uv pip install --system --no-dev --frozen
 
 # Copy source code
 COPY src/ ./src/
-COPY main.py ./
 
 # Install the package
 RUN uv pip install --system --no-deps .
@@ -75,7 +74,6 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
 COPY --from=builder /build/src ./src
-COPY --from=builder /build/main.py ./
 
 # Create directory for logs (if needed)
 RUN mkdir -p /app/logs && chown -R pgmcp:pgmcp /app
@@ -87,10 +85,10 @@ USER pgmcp
 EXPOSE 9090
 
 # Health check
-# Check if the process is running
+# Verify the pg_mcp package is importable in the runtime image
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import psutil; exit(0 if any('python' in p.name() for p in psutil.process_iter()) else 1)" || exit 1
+    CMD python -c "import pg_mcp" || exit 1
 
 # Default command
-# Run the MCP server
-CMD ["python", "main.py"]
+# Run the MCP server (stdio transport)
+CMD ["python", "-m", "pg_mcp"]

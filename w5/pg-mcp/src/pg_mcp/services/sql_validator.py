@@ -5,6 +5,7 @@ It ensures that only safe, read-only queries are executed and blocks potentially
 dangerous operations.
 """
 
+import re
 from typing import ClassVar
 
 import sqlglot
@@ -12,6 +13,7 @@ from sqlglot import exp
 
 from pg_mcp.config.settings import SecurityConfig
 from pg_mcp.models.errors import SecurityViolationError, SQLParseError
+from pg_mcp.models.query import ValidationResult
 
 
 class SQLValidator:
@@ -26,13 +28,16 @@ class SQLValidator:
     """
 
     # Allowed statement types at the top level (including set operations)
-    ALLOWED_STATEMENT_TYPES: ClassVar = {
-        exp.Select, exp.Union, exp.Intersect, exp.Except
-    }
+    ALLOWED_STATEMENT_TYPES: ClassVar = {exp.Select, exp.Union, exp.Intersect, exp.Except}
 
     # Allowed top-level expressions (including CTEs)
     ALLOWED_TOP_LEVEL: ClassVar = {
-        exp.Select, exp.Union, exp.Intersect, exp.Except, exp.With, exp.Subquery
+        exp.Select,
+        exp.Union,
+        exp.Intersect,
+        exp.Except,
+        exp.With,
+        exp.Subquery,
     }
 
     # Forbidden statement types
@@ -192,6 +197,45 @@ class SQLValidator:
 
         if error := self._check_subquery_safety(statement):
             raise SecurityViolationError(error)
+
+    def validate_detail(self, sql: str) -> ValidationResult:
+        """Validate SQL and return a structured result without raising.
+
+        Convenience wrapper for callers that want the full ValidationResult
+        model (including which blocked functions, if any, triggered rejection).
+
+        Args:
+            sql: SQL query string to validate.
+
+        Returns:
+            ValidationResult: Structured validation outcome. On failure,
+                uses_blocked_functions carries the functions named in the
+                violation message (empty for non-function violations).
+        """
+        try:
+            self.validate_or_raise(sql)
+        except (SecurityViolationError, SQLParseError) as e:
+            message = str(e)
+            # Recover the blocked function name (if any) from the violation
+            # message, e.g. "Function 'pg_sleep' is blocked..."
+            blocked = re.findall(r"Function '([\w.]+)' is blocked", message)
+            return ValidationResult(
+                is_valid=False,
+                is_select=False,
+                # Not confirmed either way on failure; is_safe already
+                # returns False because is_valid is False.
+                allows_data_modification=False,
+                uses_blocked_functions=blocked,
+                error_message=message,
+            )
+
+        return ValidationResult(
+            is_valid=True,
+            is_select=True,
+            allows_data_modification=False,
+            uses_blocked_functions=[],
+            error_message=None,
+        )
 
     def _check_statement_type(self, statement: exp.Expression) -> str | None:
         """Check if statement type is allowed.

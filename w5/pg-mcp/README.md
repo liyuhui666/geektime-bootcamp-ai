@@ -81,8 +81,7 @@ DATABASE_PASSWORD=your_password
 OPENAI_API_KEY=sk-your-api-key-here
 OPENAI_MODEL=gpt-5.2-mini
 
-# 安全设置（可选，显示默认值）
-SECURITY_ALLOW_WRITE_OPERATIONS=false
+# 安全设置（可选，显示默认值；本服务强制只读，无写操作开关）
 SECURITY_MAX_ROWS=10000
 SECURITY_MAX_EXECUTION_TIME=30
 ```
@@ -95,10 +94,10 @@ SECURITY_MAX_EXECUTION_TIME=30
 
 ```bash
 # 使用 UV
-uv run python main.py
+uv run python -m pg_mcp
 
 # 或使用 pip
-python main.py
+python -m pg_mcp
 ```
 
 #### 与 Claude Desktop 集成
@@ -119,7 +118,7 @@ python main.py
         "/absolute/path/to/pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "localhost",
@@ -313,7 +312,6 @@ Return Type: sql
 
 | 变量                              | 描述                      | 默认值            |
 |-----------------------------------|---------------------------|-------------------|
-| `SECURITY_ALLOW_WRITE_OPERATIONS` | 允许 INSERT/UPDATE/DELETE | `false`           |
 | `SECURITY_BLOCKED_FUNCTIONS`      | 逗号分隔的函数黑名单      | 参考 .env.example |
 | `SECURITY_MAX_ROWS`               | 每个查询的最大行数        | `10000`           |
 | `SECURITY_MAX_EXECUTION_TIME`     | 查询超时（秒）              | `30`              |
@@ -415,7 +413,7 @@ pg-mcp/
 ├── fixtures/               # 测试数据库 fixture
 ├── .env.example            # 环境模板
 ├── pyproject.toml          # 项目配置
-└── main.py                 # 入口点
+└── src/pg_mcp/__main__.py  # 入口点 (python -m pg_mcp)
 ```
 
 ## Docker 部署
@@ -547,7 +545,7 @@ Error: Schema not found in cache
 
 ```bash
 export OBSERVABILITY_LOG_LEVEL=DEBUG
-uv run python main.py
+uv run python -m pg_mcp
 ```
 
 ## Claude Desktop 配置
@@ -566,7 +564,7 @@ uv run python main.py
         "/Users/yourname/projects/pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "localhost",
@@ -599,7 +597,7 @@ uv run python main.py
         "C:\\Users\\YourName\\projects\\pg-mcp",
         "run",
         "python",
-        "main.py"
+        "-m", "pg_mcp"
       ],
       "env": {
         "DATABASE_HOST": "localhost",
@@ -622,7 +620,7 @@ uv run python main.py
   "mcpServers": {
     "postgres": {
       "command": "/absolute/path/to/pg-mcp/.venv/bin/python",
-      "args": ["main.py"],
+      "args": ["-m", "pg_mcp"],
       "cwd": "/absolute/path/to/pg-mcp",
       "env": {
         "DATABASE_HOST": "localhost",

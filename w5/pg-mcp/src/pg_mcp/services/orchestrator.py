@@ -6,6 +6,7 @@ validation. It implements retry logic, error handling, and request tracking.
 """
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -18,6 +19,7 @@ from pg_mcp.models.errors import (
     ErrorCode,
     LLMError,
     PgMcpError,
+    QuestionTooLongError,
     SchemaLoadError,
     SecurityViolationError,
     SQLParseError,
@@ -134,6 +136,21 @@ class QueryOrchestrator:
         )
 
         try:
+            # Step 0: Enforce configured question length. QueryRequest's own
+            # max_length covers the model-level bound; this honors a lower
+            # VALIDATION_MAX_QUESTION_LENGTH override from settings.
+            if len(request.question) > self.validation_config.max_question_length:
+                raise QuestionTooLongError(
+                    message=(
+                        f"Question length {len(request.question)} exceeds maximum of "
+                        f"{self.validation_config.max_question_length} characters"
+                    ),
+                    details={
+                        "length": len(request.question),
+                        "max_length": self.validation_config.max_question_length,
+                    },
+                )
+
             # Step 1: Resolve database name
             database_name = self._resolve_database(request.database)
             logger.debug(
@@ -174,7 +191,6 @@ class QueryOrchestrator:
                 schema=schema,
                 request_id=request_id,
             )
-
             # Step 4: If return_type is SQL, return early
             if request.return_type == ReturnType.SQL:
                 logger.info(
@@ -329,7 +345,7 @@ class QueryOrchestrator:
         question: str,
         schema: Any,
         request_id: str,
-    ) -> tuple[str, ValidationResult, int | None]:
+    ) -> tuple[str, ValidationResult, int]:
         """Generate and validate SQL with retry logic on validation failures.
 
         This method implements a retry loop that:
@@ -345,7 +361,8 @@ class QueryOrchestrator:
             request_id: Request ID for tracking.
 
         Returns:
-            tuple: (generated_sql, validation_result, tokens_used)
+            tuple: (generated_sql, validation_result, tokens_used) where
+                tokens_used aggregates usage across all generation attempts.
 
         Raises:
             LLMError: If circuit breaker is open or generation fails.
@@ -372,7 +389,7 @@ class QueryOrchestrator:
         previous_sql: str | None = None
         error_feedback: str | None = None
         max_retries = self.resilience_config.max_retries
-        tokens_used: int | None = None
+        tokens_used = 0
 
         for attempt in range(max_retries + 1):
             try:
@@ -386,15 +403,14 @@ class QueryOrchestrator:
                 )
 
                 # Generate SQL
-                generated_sql = await self.sql_generator.generate(
+                result = await self.sql_generator.generate(
                     question=question,
                     schema=schema,
                     previous_attempt=previous_sql,
                     error_feedback=error_feedback,
                 )
-
-                # Note: tokens_used would come from OpenAI response metadata if available
-                # For now, we don't extract it, but it can be added later
+                generated_sql = result.sql
+                tokens_used += result.tokens_used
 
                 logger.debug(
                     "SQL generated",
@@ -441,17 +457,13 @@ class QueryOrchestrator:
                     extra={
                         "request_id": request_id,
                         "attempts": attempt + 1,
+                        "tokens_used": tokens_used,
                     },
                 )
 
-                # Build validation result
-                validation_result = ValidationResult(
-                    is_valid=True,
-                    is_select=True,
-                    allows_data_modification=False,
-                    uses_blocked_functions=[],
-                    error_message=None,
-                )
+                # Build validation result from the validator so the response
+                # reflects what was actually checked (blocked functions, etc.)
+                validation_result = self.sql_validator.validate_detail(generated_sql)
 
                 return generated_sql, validation_result, tokens_used
 
@@ -549,11 +561,13 @@ class QueryOrchestrator:
 
     @staticmethod
     def _get_current_time_ms() -> float:
-        """Get current time in milliseconds.
+        """Get monotonic timestamp in milliseconds.
+
+        Uses time.perf_counter instead of time.time so duration measurements
+        are immune to system clock adjustments (NTP resyncs, DST, manual changes).
+        The absolute value is meaningless; only differences are consumed.
 
         Returns:
-            float: Current time in milliseconds since epoch.
+            float: Monotonic timestamp in milliseconds.
         """
-        import time
-
-        return time.time() * 1000
+        return time.perf_counter() * 1000

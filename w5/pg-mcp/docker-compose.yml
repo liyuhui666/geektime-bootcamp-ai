@@ -78,13 +78,11 @@ services:
       OPENAI_TIMEOUT: ${OPENAI_TIMEOUT:-30}
 
       # Security settings
-      SECURITY_ALLOW_WRITE_OPERATIONS: ${SECURITY_ALLOW_WRITE_OPERATIONS:-false}
       SECURITY_MAX_ROWS: ${SECURITY_MAX_ROWS:-10000}
       SECURITY_MAX_EXECUTION_TIME: ${SECURITY_MAX_EXECUTION_TIME:-30}
 
       # Validation settings
       VALIDATION_MAX_QUESTION_LENGTH: ${VALIDATION_MAX_QUESTION_LENGTH:-10000}
-      VALIDATION_MIN_CONFIDENCE_SCORE: ${VALIDATION_MIN_CONFIDENCE_SCORE:-70}
 
       # Cache settings
       CACHE_ENABLED: ${CACHE_ENABLED:-true}
@@ -116,7 +114,8 @@ services:
         condition: service_healthy
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9090/metrics || exit 1"]
+      # python:3.14-slim has no curl; use urllib against the metrics endpoint
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9090/metrics')\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

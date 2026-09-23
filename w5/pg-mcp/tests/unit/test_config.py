@@ -140,7 +140,12 @@ class TestOpenAIConfig:
             OpenAIConfig(api_key="sk-test", max_tokens=50)
 
         with pytest.raises(ValidationError):
-            OpenAIConfig(api_key="sk-test", max_tokens=5000)
+            OpenAIConfig(api_key="sk-test", max_tokens=40000)
+
+    def test_large_max_tokens_accepted(self) -> None:
+        """Test large max_tokens (for long-context models) is accepted."""
+        config = OpenAIConfig(api_key="sk-test", max_tokens=32000)
+        assert config.max_tokens == 32000
 
     def test_invalid_temperature(self) -> None:
         """Test invalid temperature is rejected."""
@@ -157,7 +162,6 @@ class TestSecurityConfig:
     def test_default_values(self) -> None:
         """Test default configuration values."""
         config = SecurityConfig()
-        assert config.allow_write_operations is False
         assert config.max_rows == 10000
         assert config.max_execution_time == 30.0
         assert "pg_sleep" in config.blocked_functions
@@ -179,10 +183,10 @@ class TestSecurityConfig:
         assert "func2" in config.blocked_functions
         assert "func3" in config.blocked_functions
 
-    def test_allow_write_operations(self) -> None:
-        """Test enabling write operations."""
-        config = SecurityConfig(allow_write_operations=True)
-        assert config.allow_write_operations is True
+    def test_no_write_operations_switch(self) -> None:
+        """Server is read-only by hard constraint; no write switch exists."""
+        config = SecurityConfig()
+        assert not hasattr(config, "allow_write_operations")
 
     def test_invalid_max_rows(self) -> None:
         """Test invalid max_rows is rejected."""
@@ -200,24 +204,24 @@ class TestValidationConfig:
         """Test default configuration values."""
         config = ValidationConfig()
         assert config.max_question_length == 10000
-        assert config.min_confidence_score == 70
+        assert config.confidence_threshold == 70
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
         config = ValidationConfig(
             max_question_length=5000,
-            min_confidence_score=80,
+            confidence_threshold=80,
         )
         assert config.max_question_length == 5000
-        assert config.min_confidence_score == 80
+        assert config.confidence_threshold == 80
 
     def test_invalid_confidence_score(self) -> None:
         """Test invalid confidence score is rejected."""
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=-1)
+            ValidationConfig(confidence_threshold=-1)
 
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=101)
+            ValidationConfig(confidence_threshold=101)
 
 
 class TestCacheConfig:
@@ -360,12 +364,12 @@ class TestSettings:
                 port=5433,
             ),
             security=SecurityConfig(
-                allow_write_operations=True,
+                max_rows=500,
             ),
         )
         assert settings.database.host == "custom.host"
         assert settings.database.port == 5433
-        assert settings.security.allow_write_operations is True
+        assert settings.security.max_rows == 500
 
 
 class TestSettingsGlobalInstance:

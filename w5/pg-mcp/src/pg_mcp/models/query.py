@@ -97,6 +97,7 @@ class ResultValidationResult(BaseModel):
     )
     explanation: str = Field(..., description="Explanation of the validation assessment")
     suggestion: str | None = Field(None, description="Optional suggestion for improving the query")
+    tokens_used: int = Field(default=0, ge=0, description="LLM tokens used for the validation call")
     is_acceptable: bool = Field(
         ..., description="Whether results are acceptable based on confidence threshold"
     )
@@ -163,10 +164,10 @@ class QueryResponse(BaseModel):
         Returns:
             dict: Dictionary representation compatible with MCP protocol.
         """
-        # Use model_dump but ensure tokens_used is always present
-        result = self.model_dump(exclude_none=False)
+        # Exclude None fields (None marks absence, not a value), but keep
+        # tokens_used always present, filling 0 when no LLM call succeeded.
+        result = self.model_dump(exclude_none=True)
 
-        # Ensure tokens_used is always present (use 0 if None)
         if result.get("tokens_used") is None:
             result["tokens_used"] = 0
 
@@ -210,11 +211,3 @@ class QueryResponse(BaseModel):
             if not success and v is None:
                 raise ValueError("Error must be present when success is False")
         return v
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert response to dictionary.
-
-        Returns:
-            dict: Dictionary representation of query response.
-        """
-        return self.model_dump(exclude_none=True)

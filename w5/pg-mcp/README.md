@@ -186,6 +186,13 @@ Return Type: sql
 - **`result`**（默认）：执行查询并返回结果
 - **`sql`**：生成并验证 SQL，但不执行
 
+### 目标数据库
+
+`query` 工具支持可选的 `database` 参数指定目标数据库：
+
+- 单数据库模式：无需指定，自动选择唯一配置的库
+- 多数据库模式：不指定时使用 `MULTIDB_DEFAULT_DATABASE`；未设置默认库则必须显式指定，否则请求被拒绝并列出可用数据库
+
 ### 响应格式
 
 #### 成功查询响应
@@ -298,6 +305,26 @@ Return Type: sql
 | `DATABASE_MAX_POOL_SIZE`   | 池中最大连接数  | `20`        |
 | `DATABASE_COMMAND_TIMEOUT` | 查询超时（秒）    | `30`        |
 
+### 多数据库配置
+
+默认为单数据库模式（`DATABASE_*` 变量）。设置 `MULTIDB_DATABASES_JSON` 后切换到多数据库模式，此时 `DATABASE_*` 变量被忽略（启动时输出警告日志）：
+
+```bash
+MULTIDB_DATABASES_JSON='[
+  {"connection": {"name": "appdb", "host": "localhost", "user": "postgres", "password": "secret"}},
+  {"connection": {"name": "analytics", "host": "warehouse.internal", "user": "report", "password": "secret"},
+   "security": {"blocked_tables": ["hr.salaries", "audit.events"], "allow_explain": true}}
+]'
+MULTIDB_DEFAULT_DATABASE=appdb
+```
+
+规则：
+
+- 每个条目的 `connection` 字段与 `DATABASE_*` 含义相同，`name` 必填；数据库名重复会导致启动失败（fail-fast）
+- 每个条目的 `security` 字段可选，支持按数据库覆盖：`blocked_tables`、`blocked_columns`、`allow_explain`、`allow_explain_analyze`、`readonly_role`、`safe_search_path`（未设置的字段回退到全局 `SECURITY_*` 配置；`blocked_functions`、`max_rows`、`max_execution_time` 仅全局生效）
+- 策略跟随数据库：请求路由到哪个数据库，就完整使用该库的策略做校验与执行，无法通过切换数据库绕过黑名单
+- `MULTIDB_DEFAULT_DATABASE` 指定未显式传参时的默认库；多数据库模式下未设置则请求必须显式指定 `database` 参数
+
 ### OpenAI 设置
 
 | 变量                 | 描述                    | 默认值         |
@@ -313,6 +340,11 @@ Return Type: sql
 | 变量                              | 描述                      | 默认值            |
 |-----------------------------------|---------------------------|-------------------|
 | `SECURITY_BLOCKED_FUNCTIONS`      | 逗号分隔的函数黑名单      | 参考 .env.example |
+| `SECURITY_BLOCKED_TABLES`         | 逗号分隔的表黑名单，支持裸表名（`internal`）或带模式名（`audit.logs`） | 空 |
+| `SECURITY_BLOCKED_COLUMNS`        | 逗号分隔的列黑名单，支持裸列名（`password`）或表限定（`users.password`） | 空 |
+| `SECURITY_ALLOW_EXPLAIN`          | 允许 EXPLAIN（仅执行计划，不执行语句） | `false` |
+| `SECURITY_ALLOW_EXPLAIN_ANALYZE`  | 允许 EXPLAIN ANALYZE（会实际执行语句，慎开） | `false` |
+| `SECURITY_BLOCK_SYSTEM_CATALOGS`  | 拒绝访问 `pg_catalog` / `information_schema` | `false` |
 | `SECURITY_MAX_ROWS`               | 每个查询的最大行数        | `10000`           |
 | `SECURITY_MAX_EXECUTION_TIME`     | 查询超时（秒）              | `30`              |
 

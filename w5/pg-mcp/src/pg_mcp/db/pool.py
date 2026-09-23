@@ -7,15 +7,19 @@ pools for PostgreSQL databases.
 import asyncpg
 from asyncpg import Pool
 
-from pg_mcp.config.settings import DatabaseConfig
+from pg_mcp.config.settings import DatabaseConfig, DatabaseConnectionParams
+
+# Both config models expose the same pool-relevant attribute names.
+PoolConfig = DatabaseConfig | DatabaseConnectionParams
 
 
-async def create_pool(config: DatabaseConfig) -> Pool:
+async def create_pool(config: PoolConfig) -> Pool:
     """Create a connection pool for a single database.
 
     Args:
         config: Database configuration containing connection parameters
-            and pool settings.
+            and pool settings (single-database DatabaseConfig or a
+            multi-database DatabaseConnectionParams entry).
 
     Returns:
         Pool: An asyncpg connection pool instance.

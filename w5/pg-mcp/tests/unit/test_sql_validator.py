@@ -11,9 +11,15 @@ Tests cover:
 
 import pytest
 
+from pg_mcp.config.policy import EffectivePolicy
 from pg_mcp.config.settings import SecurityConfig
 from pg_mcp.models.errors import SecurityViolationError, SQLParseError
 from pg_mcp.services.sql_validator import SQLValidator
+
+
+def make_validator(**security_kwargs: object) -> SQLValidator:
+    """Build a validator from an EffectivePolicy merged from SecurityConfig kwargs."""
+    return SQLValidator(policy=EffectivePolicy.merge(SecurityConfig(**security_kwargs), None))
 
 
 class TestValidStatements:
@@ -22,8 +28,7 @@ class TestValidStatements:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create a basic validator with default security config."""
-        config = SecurityConfig()
-        return SQLValidator(config=config)
+        return make_validator()
 
     def test_simple_select(self, validator: SQLValidator) -> None:
         """Test simple SELECT statement."""
@@ -154,8 +159,7 @@ class TestRejectedStatements:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for testing rejected statements."""
-        config = SecurityConfig()
-        return SQLValidator(config=config)
+        return make_validator()
 
     def test_insert_rejected(self, validator: SQLValidator) -> None:
         """Test INSERT statement is rejected."""
@@ -220,8 +224,7 @@ class TestDangerousFunctions:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator with default dangerous function blocking."""
-        config = SecurityConfig()
-        return SQLValidator(config=config)
+        return make_validator()
 
     def test_pg_sleep_blocked(self, validator: SQLValidator) -> None:
         """Test pg_sleep function is blocked."""
@@ -260,8 +263,7 @@ class TestDangerousFunctions:
 
     def test_custom_blocked_function(self) -> None:
         """Test custom blocked function from config."""
-        config = SecurityConfig(blocked_functions=["my_custom_func", "another_func"])
-        validator = SQLValidator(config=config)
+        validator = make_validator(blocked_functions=["my_custom_func", "another_func"])
 
         sql = "SELECT my_custom_func(123)"
         with pytest.raises(SecurityViolationError) as exc_info:
@@ -291,8 +293,7 @@ class TestSensitiveResources:
 
     def test_blocked_table_rejected(self) -> None:
         """Test access to blocked table is rejected."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, blocked_tables=["passwords", "secrets", "api_keys"])
+        validator = make_validator(blocked_tables=["passwords", "secrets", "api_keys"])
 
         sql = "SELECT * FROM passwords"
         with pytest.raises(SecurityViolationError) as exc_info:
@@ -301,8 +302,7 @@ class TestSensitiveResources:
 
     def test_blocked_table_in_join(self) -> None:
         """Test blocked table in JOIN is rejected."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, blocked_tables=["sensitive_data"])
+        validator = make_validator(blocked_tables=["sensitive_data"])
 
         sql = """
             SELECT u.name
@@ -315,8 +315,7 @@ class TestSensitiveResources:
 
     def test_blocked_column_rejected(self) -> None:
         """Test access to blocked column is rejected."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, blocked_columns=["password", "ssn", "credit_card"])
+        validator = make_validator(blocked_columns=["password", "ssn", "credit_card"])
 
         sql = "SELECT id, name, password FROM users"
         with pytest.raises(SecurityViolationError) as exc_info:
@@ -325,8 +324,7 @@ class TestSensitiveResources:
 
     def test_blocked_column_case_insensitive(self) -> None:
         """Test column blocking is case-insensitive."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, blocked_columns=["SECRET_KEY"])
+        validator = make_validator(blocked_columns=["SECRET_KEY"])
 
         sql = "SELECT id, secret_key FROM users"
         with pytest.raises(SecurityViolationError) as exc_info:
@@ -335,8 +333,7 @@ class TestSensitiveResources:
 
     def test_partial_column_match(self) -> None:
         """Test that column blocking is exact match, not partial."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, blocked_columns=["password"])
+        validator = make_validator(blocked_columns=["password"])
 
         # 'password_hash' should be allowed if only 'password' is blocked
         sql = "SELECT id, password_hash FROM users"
@@ -346,8 +343,7 @@ class TestSensitiveResources:
 
     def test_qualified_column_blocked(self) -> None:
         """Test blocking qualified column names (table.column)."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, blocked_columns=["users.ssn"])
+        validator = make_validator(blocked_columns=["users.ssn"])
 
         sql = "SELECT users.id, users.ssn FROM users"
         # This should NOT be blocked because we check the column name without table prefix
@@ -364,8 +360,7 @@ class TestMultiStatement:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for multi-statement testing."""
-        config = SecurityConfig()
-        return SQLValidator(config=config)
+        return make_validator()
 
     def test_multiple_statements_rejected(self, validator: SQLValidator) -> None:
         """Test multiple statements separated by semicolon are rejected."""
@@ -405,8 +400,7 @@ class TestEdgeCases:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for edge case testing."""
-        config = SecurityConfig()
-        return SQLValidator(config=config)
+        return make_validator()
 
     def test_malformed_sql(self, validator: SQLValidator) -> None:
         """Test malformed SQL raises parse error."""
@@ -458,8 +452,7 @@ class TestExplainStatements:
 
     def test_explain_rejected_by_default(self) -> None:
         """Test EXPLAIN is rejected when not explicitly allowed."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, allow_explain=False)
+        validator = make_validator(allow_explain=False)
 
         sql = "EXPLAIN SELECT * FROM users"
         with pytest.raises(SecurityViolationError) as exc_info:
@@ -468,38 +461,42 @@ class TestExplainStatements:
 
     def test_explain_allowed_when_enabled(self) -> None:
         """Test EXPLAIN is allowed when explicitly enabled."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, allow_explain=True)
+        validator = make_validator(allow_explain=True)
 
         sql = "EXPLAIN SELECT * FROM users"
         is_valid, error = validator.validate(sql)
         assert is_valid
         assert error is None
 
-    def test_explain_analyze_allowed(self) -> None:
-        """Test EXPLAIN ANALYZE is allowed when EXPLAIN is enabled."""
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, allow_explain=True)
+    def test_explain_analyze_requires_own_switch(self) -> None:
+        """EXPLAIN ANALYZE executes the statement: it needs its own switch.
 
-        sql = "EXPLAIN ANALYZE SELECT * FROM users WHERE id > 100"
-        is_valid, error = validator.validate(sql)
-        assert is_valid
-        assert error is None
-
-    def test_explain_with_dangerous_query_allowed(self) -> None:
-        """Test EXPLAIN with dangerous underlying query is allowed.
-
-        EXPLAIN only shows query plans and doesn't execute the query,
-        so even "EXPLAIN DELETE" is safe as it won't modify data.
+        Plain allow_explain=True is NOT enough (design §4.5).
         """
-        config = SecurityConfig()
-        validator = SQLValidator(config=config, allow_explain=True)
+        validator = make_validator(allow_explain=True)
+        assert validator.validate("EXPLAIN ANALYZE SELECT * FROM users")[0] is False
+        assert validator.validate("EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM users")[0] is False
 
-        # EXPLAIN DELETE is safe - it only shows the execution plan
-        sql = "EXPLAIN DELETE FROM users"
-        is_valid, error = validator.validate(sql)
-        assert is_valid
-        assert error is None
+        analyze_ok = make_validator(allow_explain=True, allow_explain_analyze=True)
+        assert analyze_ok.validate("EXPLAIN ANALYZE SELECT * FROM users WHERE id > 100")[0] is True
+        assert analyze_ok.validate("EXPLAIN (ANALYZE, BUFFERS) SELECT 1")[0] is True
+
+    def test_explain_with_forbidden_inner_rejected(self) -> None:
+        """EXPLAIN does not launder the inner statement past validation.
+
+        The inner query must pass ALL rules; "EXPLAIN DELETE" is rejected
+        even though EXPLAIN alone would not execute it (design §4.5).
+        """
+        validator = make_validator(allow_explain=True)
+
+        is_valid, error = validator.validate("EXPLAIN DELETE FROM users")
+        assert is_valid is False
+        assert "DELETE" in (error or "")
+
+        # Blocked functions inside EXPLAIN are caught too
+        is_valid, error = validator.validate("EXPLAIN SELECT pg_sleep(10)")
+        assert is_valid is False
+        assert "pg_sleep" in (error or "")
 
 
 class TestValidatorHelperMethods:
@@ -508,8 +505,7 @@ class TestValidatorHelperMethods:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for testing helper methods."""
-        config = SecurityConfig()
-        return SQLValidator(config=config)
+        return make_validator()
 
     def test_normalize_sql(self, validator: SQLValidator) -> None:
         """Test SQL normalization."""
@@ -578,8 +574,7 @@ class TestCTEWithDangerousOperations:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for CTE testing."""
-        config = SecurityConfig()
-        return SQLValidator(config=config)
+        return make_validator()
 
     def test_cte_with_multiple_selects(self, validator: SQLValidator) -> None:
         """Test CTE with multiple SELECT CTEs is allowed."""
@@ -626,8 +621,7 @@ class TestSubqueryWithForbiddenOperations:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for subquery testing."""
-        config = SecurityConfig()
-        return SQLValidator(config=config)
+        return make_validator()
 
     def test_subquery_with_insert_rejected(self, validator: SQLValidator) -> None:
         """Test subquery containing INSERT is rejected."""
@@ -666,7 +660,7 @@ class TestValidateDetail:
 
     @pytest.fixture
     def validator(self) -> SQLValidator:
-        return SQLValidator(config=SecurityConfig())
+        return make_validator()
 
     def test_valid_sql_returns_success_detail(self, validator: SQLValidator) -> None:
         result = validator.validate_detail("SELECT * FROM users")
@@ -698,3 +692,209 @@ class TestValidateDetail:
         result = validator.validate_detail("   ")
         assert result.is_valid is False
         assert result.error_message is not None
+
+
+class TestSchemaQualifiedTableBlocking:
+    """blocked_tables supports bare names and schema-qualified names (§4.5)."""
+
+    def test_schema_qualified_blocked(self) -> None:
+        v = make_validator(blocked_tables=["audit.logs"])
+        with pytest.raises(SecurityViolationError, match=r"audit\.logs"):
+            v.validate_or_raise("SELECT * FROM audit.logs")
+
+    def test_schema_qualified_exact_match_required(self) -> None:
+        """Blocking audit.logs must not block public.logs."""
+        v = make_validator(blocked_tables=["audit.logs"])
+        is_valid, error = v.validate("SELECT * FROM public.logs")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_bare_name_blocks_table_in_any_schema(self) -> None:
+        """Bare 'internal' matches table_name regardless of schema."""
+        v = make_validator(blocked_tables=["internal"])
+        with pytest.raises(SecurityViolationError):
+            v.validate_or_raise("SELECT * FROM other_schema.internal")
+
+    def test_bare_name_does_not_block_same_prefix_table(self) -> None:
+        """Bare 'internal' must not block internal.events (different table)."""
+        v = make_validator(blocked_tables=["internal"])
+        is_valid, error = v.validate("SELECT * FROM internal.events")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_blocked_table_inside_cte(self) -> None:
+        v = make_validator(blocked_tables=["secrets"])
+        with pytest.raises(SecurityViolationError):
+            v.validate_or_raise("WITH x AS (SELECT * FROM secrets) SELECT * FROM x")
+
+    def test_blocked_table_inside_subquery(self) -> None:
+        v = make_validator(blocked_tables=["secrets"])
+        with pytest.raises(SecurityViolationError):
+            v.validate_or_raise("SELECT * FROM (SELECT * FROM secrets) s")
+
+    def test_case_insensitive_matching(self) -> None:
+        v = make_validator(blocked_tables=["Secrets"])
+        with pytest.raises(SecurityViolationError):
+            v.validate_or_raise("SELECT * FROM audit.SECRETS")
+
+
+class TestColumnBlockingWithTableResolution:
+    """blocked_columns: table-qualified entries resolve via statement context."""
+
+    def test_qualified_column_blocked_on_matching_table(self) -> None:
+        v = make_validator(blocked_columns=["users.password"])
+        with pytest.raises(SecurityViolationError, match="password"):
+            v.validate_or_raise("SELECT password FROM users")
+
+    def test_qualified_column_allowed_on_other_tables(self) -> None:
+        """users.password must not block accounts.password."""
+        v = make_validator(blocked_columns=["users.password"])
+        is_valid, error = v.validate("SELECT password FROM accounts")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_qualified_column_blocked_via_alias(self) -> None:
+        v = make_validator(blocked_columns=["users.password"])
+        with pytest.raises(SecurityViolationError):
+            v.validate_or_raise("SELECT u.password FROM users u")
+
+    def test_qualified_column_allows_other_columns(self) -> None:
+        v = make_validator(blocked_columns=["users.password"])
+        is_valid, error = v.validate("SELECT id, name FROM users")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_bare_column_blocks_everywhere(self) -> None:
+        v = make_validator(blocked_columns=["ssn"])
+        with pytest.raises(SecurityViolationError):
+            v.validate_or_raise("SELECT ssn FROM accounts")
+
+    def test_column_in_where_clause(self) -> None:
+        v = make_validator(blocked_columns=["users.password"])
+        with pytest.raises(SecurityViolationError):
+            v.validate_or_raise("SELECT id FROM users WHERE password = 'x'")
+
+    def test_join_context(self) -> None:
+        v = make_validator(blocked_columns=["orders.internal_note"])
+        is_valid, error = v.validate(
+            "SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id"
+        )
+        assert is_valid, f"unexpected error: {error}"
+
+
+class TestSystemCatalogBlocking:
+    """block_system_catalogs is opt-in (README examples rely on metadata reads)."""
+
+    def test_catalogs_allowed_by_default(self) -> None:
+        v = make_validator()
+        is_valid, error = v.validate("SELECT * FROM information_schema.tables")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_pg_catalog_blocked_when_enabled(self) -> None:
+        v = make_validator(block_system_catalogs=True)
+        with pytest.raises(SecurityViolationError, match="pg_catalog"):
+            v.validate_or_raise("SELECT * FROM pg_catalog.pg_tables")
+
+    def test_information_schema_blocked_when_enabled(self) -> None:
+        v = make_validator(block_system_catalogs=True)
+        with pytest.raises(SecurityViolationError, match="information_schema"):
+            v.validate_or_raise("SELECT table_name FROM information_schema.columns")
+
+
+class TestExplainOptions:
+    """EXPLAIN option parsing: prefix and bracket forms (§4.5)."""
+
+    def test_explain_verbose_prefix_allowed(self) -> None:
+        v = make_validator(allow_explain=True)
+        is_valid, error = v.validate("EXPLAIN VERBOSE SELECT 1")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_explain_bracket_form_allowed(self) -> None:
+        v = make_validator(allow_explain=True)
+        is_valid, error = v.validate("EXPLAIN (COSTS FALSE) SELECT 1")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_explain_analyze_bracket_form_blocked_by_default(self) -> None:
+        v = make_validator(allow_explain=True)
+        with pytest.raises(SecurityViolationError, match="EXPLAIN ANALYZE"):
+            v.validate_or_raise("EXPLAIN (ANALYZE, BUFFERS) SELECT 1")
+
+    def test_explain_analyze_bracket_form_allowed_with_switch(self) -> None:
+        v = make_validator(allow_explain=True, allow_explain_analyze=True)
+        is_valid, error = v.validate("EXPLAIN (ANALYZE, BUFFERS) SELECT 1")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_explain_unknown_option_is_parsed_as_body(self) -> None:
+        """Non-option tokens are treated as statement text -> parse error."""
+        v = make_validator(allow_explain=True)
+        with pytest.raises(SQLParseError):
+            v.validate_or_raise("EXPLAIN FROBNICATE SELECT 1")
+
+    def test_explain_inner_blocked_table(self) -> None:
+        """Inner statement must pass all rules, including blocklists."""
+        v = make_validator(allow_explain=True, blocked_tables=["secrets"])
+        with pytest.raises(SecurityViolationError, match="secrets"):
+            v.validate_or_raise("EXPLAIN SELECT * FROM secrets")
+
+    def test_explain_disabled_entirely_by_default(self) -> None:
+        v = make_validator()
+        with pytest.raises(SecurityViolationError, match="EXPLAIN"):
+            v.validate_or_raise("EXPLAIN SELECT 1")
+
+
+class TestNestedStatementSafety:
+    """Whole-tree read-only enforcement: CTE bodies and subqueries (§4.5)."""
+
+    def test_data_modifying_cte_rejected(self) -> None:
+        """WITH d AS (DELETE ...) SELECT ... must be rejected."""
+        v = make_validator()
+        with pytest.raises(SecurityViolationError, match="DELETE"):
+            v.validate_or_raise("WITH d AS (DELETE FROM users) SELECT * FROM d")
+
+    def test_insert_cte_rejected(self) -> None:
+        v = make_validator()
+        with pytest.raises(SecurityViolationError, match="INSERT"):
+            v.validate_or_raise("WITH i AS (INSERT INTO logs VALUES (1)) SELECT * FROM i")
+
+    def test_union_subquery_allowed(self) -> None:
+        """UNION inside a FROM-subquery is read-only and must be allowed."""
+        v = make_validator()
+        is_valid, error = v.validate("SELECT * FROM (SELECT 1 UNION SELECT 2) t")
+        assert is_valid, f"unexpected error: {error}"
+
+    def test_plain_subquery_still_allowed(self) -> None:
+        v = make_validator()
+        is_valid, error = v.validate("SELECT * FROM (SELECT id FROM users) t")
+        assert is_valid, f"unexpected error: {error}"
+
+
+class TestEdgeBranches:
+    """Edge branches: empty parses, non-EXPLAIN commands, EXPLAIN variants."""
+
+    def test_comment_only_sql_rejected(self) -> None:
+        v = make_validator()
+        with pytest.raises(SQLParseError):
+            v.validate_or_raise("-- just a comment")
+
+    def test_non_explain_command_rejected(self) -> None:
+        v = make_validator()
+        with pytest.raises(SecurityViolationError, match="Command"):
+            v.validate_or_raise("VACUUM users")
+
+    def test_explain_without_body_rejected(self) -> None:
+        """allow_explain=True still requires an inner statement."""
+        v = make_validator(allow_explain=True)
+        with pytest.raises(SQLParseError, match="no inner"):
+            v.validate_or_raise("EXPLAIN")
+
+    def test_explain_empty_brackets_rejected(self) -> None:
+        v = make_validator(allow_explain=True)
+        with pytest.raises(SQLParseError):
+            v.validate_or_raise("EXPLAIN ()")
+
+    def test_explain_unbalanced_paren_rejected(self) -> None:
+        v = make_validator(allow_explain=True)
+        with pytest.raises(SQLParseError):
+            v.validate_or_raise("EXPLAIN (ANALYZE SELECT 1")
+
+    def test_catalog_check_disabled_paths_other_tables(self) -> None:
+        """block_system_catalogs=True still allows non-catalog tables."""
+        v = make_validator(block_system_catalogs=True)
+        is_valid, error = v.validate("SELECT * FROM users")
+        assert is_valid, f"unexpected error: {error}"

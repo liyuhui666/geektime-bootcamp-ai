@@ -13,10 +13,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from asyncpg import Pool
-
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import ResilienceConfig, ValidationConfig
+from pg_mcp.db.runtime import DatabaseRuntime
 from pg_mcp.models.errors import (
     DatabaseError,
     ErrorCode,
@@ -43,7 +42,6 @@ from pg_mcp.resilience.backoff import backoff_delay
 from pg_mcp.resilience.circuit_breaker import CircuitBreaker
 from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.result_validator import ResultValidator
-from pg_mcp.services.sql_executor import SQLExecutor
 from pg_mcp.services.sql_generator import SQLGenerator
 from pg_mcp.services.sql_validator import SQLValidator
 
@@ -57,14 +55,16 @@ class QueryOrchestrator:
     validation. It implements retry logic with error feedback, circuit breaker
     pattern for fault tolerance, and comprehensive error handling.
 
+    Per-database components (validator, executor, pool) come from the
+    DatabaseRuntime the request is routed to, so validation and execution
+    always run under the target database's effective policy.
+
     Example:
         >>> orchestrator = QueryOrchestrator(
+        ...     runtimes=runtimes,
         ...     sql_generator=generator,
-        ...     sql_validator=validator,
-        ...     sql_executor=executor,
         ...     result_validator=result_validator,
         ...     schema_cache=cache,
-        ...     pools={"mydb": pool},
         ...     resilience_config=resilience_config,
         ...     validation_config=validation_config,
         ... )
@@ -76,26 +76,24 @@ class QueryOrchestrator:
 
     def __init__(
         self,
+        runtimes: dict[str, DatabaseRuntime],
         sql_generator: SQLGenerator,
-        sql_validator: SQLValidator,
-        sql_executor: SQLExecutor,
         result_validator: ResultValidator,
         schema_cache: SchemaCache,
-        pools: dict[str, Pool],
         resilience_config: ResilienceConfig,
         validation_config: ValidationConfig,
         rate_limiter: MultiRateLimiter | None = None,
         metrics: MetricsCollector | None = None,
+        default_database: str | None = None,
     ) -> None:
         """Initialize query orchestrator.
 
         Args:
+            runtimes: Per-database runtimes keyed by database name (pool,
+                executor, validator, effective policy).
             sql_generator: SQL generation service.
-            sql_validator: SQL validation service.
-            sql_executor: SQL execution service.
             result_validator: Result validation service.
             schema_cache: Schema cache instance.
-            pools: Dictionary mapping database names to connection pools.
             resilience_config: Resilience configuration for retries, circuit
                 breaker, and rate limiter timeouts.
             validation_config: Validation configuration including thresholds.
@@ -103,17 +101,18 @@ class QueryOrchestrator:
                 slots cover the whole pipeline and LLM slots cover the two
                 LLM call sites; None disables limiting (tests, embedding).
             metrics: Optional metrics collector (None-safe for tests).
+            default_database: Database used when a request does not specify
+                one and multiple databases are configured.
         """
+        self.runtimes = runtimes
         self.sql_generator = sql_generator
-        self.sql_validator = sql_validator
-        self.sql_executor = sql_executor
         self.result_validator = result_validator
         self.schema_cache = schema_cache
-        self.pools = pools
         self.resilience_config = resilience_config
         self.validation_config = validation_config
         self.rate_limiter = rate_limiter
         self.metrics = metrics
+        self._default_database = default_database
         self._acquire_timeout = resilience_config.rate_limit_acquire_timeout
 
         # Create circuit breaker for LLM calls
@@ -227,9 +226,10 @@ class QueryOrchestrator:
                     },
                 )
 
-            # Step 1: Resolve database name
+            # Step 1: Resolve database name and its runtime
             database_name = self._resolve_database(request.database)
             database = database_name
+            runtime = self.runtimes[database_name]
             logger.debug(
                 "Resolved database",
                 extra={"request_id": request_id, "database": database_name},
@@ -238,15 +238,9 @@ class QueryOrchestrator:
             # Step 2: Get schema from cache
             schema = self.schema_cache.get(database_name)
             if schema is None:
-                # Schema not in cache, load it
-                pool = self.pools.get(database_name)
-                if pool is None:
-                    raise DatabaseError(
-                        message=f"No connection pool available for database '{database_name}'",
-                        details={"database": database_name},
-                    )
+                # Schema not in cache, load it via the runtime's pool
                 try:
-                    schema = await self.schema_cache.load(database_name, pool)
+                    schema = await self.schema_cache.load(database_name, runtime.pool)
                 except Exception as e:
                     raise SchemaLoadError(
                         message=f"Failed to load schema for database '{database_name}': {e!s}",
@@ -263,10 +257,12 @@ class QueryOrchestrator:
             )
 
             # Step 3: Generate and validate SQL with retry logic
+            # (validation runs under this database's policy)
             generated_sql, validation_result, tokens_used = await self._generate_sql_with_retry(
                 question=request.question,
                 schema=schema,
                 request_id=request_id,
+                validator=runtime.validator,
             )
             # Step 4: If return_type is SQL, return early
             if request.return_type == ReturnType.SQL:
@@ -285,11 +281,11 @@ class QueryOrchestrator:
                     tokens_used=tokens_used,
                 )
 
-            # Step 5: Execute SQL
+            # Step 5: Execute SQL (under this database's policy)
             logger.debug("Executing SQL", extra={"request_id": request_id})
             start_time = self._get_current_time_ms()
 
-            results, total_count = await self.sql_executor.execute(generated_sql)
+            results, total_count = await runtime.executor.execute(generated_sql)
 
             execution_time_ms = self._get_current_time_ms() - start_time
             logger.info(
@@ -360,10 +356,11 @@ class QueryOrchestrator:
                 self.metrics.query_duration.observe(time.perf_counter() - started)
 
     def _resolve_database(self, database: str | None) -> str:
-        """Resolve database name from request or auto-select.
+        """Resolve database name from request, default, or auto-select.
 
-        If database is specified, validate it exists.
-        If not specified and only one database available, auto-select it.
+        Resolution order: explicit request.database (must exist) ->
+        auto-select when exactly one database is configured ->
+        configured default_database -> error listing available databases.
 
         Args:
             database: Database name from request (optional).
@@ -372,7 +369,7 @@ class QueryOrchestrator:
             str: Resolved database name.
 
         Raises:
-            DatabaseError: If database is invalid or cannot be auto-selected.
+            DatabaseError: If database is invalid or cannot be resolved.
 
         Example:
             >>> name = orchestrator._resolve_database("mydb")  # Validates "mydb" exists
@@ -380,18 +377,18 @@ class QueryOrchestrator:
         """
         if database is not None:
             # Validate specified database exists
-            if database not in self.pools:
+            if database not in self.runtimes:
                 raise DatabaseError(
                     message=f"Database '{database}' not found",
                     details={
                         "requested_database": database,
-                        "available_databases": list(self.pools.keys()),
+                        "available_databases": list(self.runtimes.keys()),
                     },
                 )
             return database
 
         # Auto-select if only one database available
-        available_dbs = list(self.pools.keys())
+        available_dbs = list(self.runtimes.keys())
         if len(available_dbs) == 0:
             raise DatabaseError(
                 message="No databases configured",
@@ -400,7 +397,10 @@ class QueryOrchestrator:
         if len(available_dbs) == 1:
             return available_dbs[0]
 
-        # Multiple databases, must specify
+        # Multiple databases: fall back to the configured default, else reject
+        if self._default_database and self._default_database in self.runtimes:
+            return self._default_database
+
         raise DatabaseError(
             message="Multiple databases available, please specify which to query",
             details={"available_databases": available_dbs},
@@ -445,6 +445,7 @@ class QueryOrchestrator:
         question: str,
         schema: Any,
         request_id: str,
+        validator: SQLValidator,
     ) -> tuple[str, ValidationResult, int]:
         """Generate and validate SQL with retry logic.
 
@@ -462,6 +463,8 @@ class QueryOrchestrator:
             question: User's natural language question.
             schema: Database schema for context.
             request_id: Request ID for tracking.
+            validator: The target database's SQL validator (its effective
+                policy decides what SQL is acceptable).
 
         Returns:
             tuple: (generated_sql, validation_result, tokens_used) where
@@ -593,7 +596,7 @@ class QueryOrchestrator:
 
             # Validate SQL
             try:
-                self.sql_validator.validate_or_raise(generated_sql)
+                validator.validate_or_raise(generated_sql)
             except (SecurityViolationError, SQLParseError) as validation_error:
                 if self.metrics is not None:
                     reason = (
@@ -643,7 +646,7 @@ class QueryOrchestrator:
 
             # Build validation result from the validator so the response
             # reflects what was actually checked (blocked functions, etc.)
-            validation_result = self.sql_validator.validate_detail(generated_sql)
+            validation_result = validator.validate_detail(generated_sql)
 
             return generated_sql, validation_result, tokens_used
 

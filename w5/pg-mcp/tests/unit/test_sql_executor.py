@@ -14,7 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 import asyncpg
 import pytest
 
-from pg_mcp.config.settings import DatabaseConfig, SecurityConfig
+from pg_mcp.config.policy import EffectivePolicy
+from pg_mcp.config.settings import SecurityConfig
 from pg_mcp.models.errors import DatabaseError, ExecutionTimeoutError
 from pg_mcp.services.sql_executor import SQLExecutor
 
@@ -39,36 +40,30 @@ def create_mock_record(data: dict[str, Any]) -> MagicMock:
 
 
 @pytest.fixture
-def security_config() -> SecurityConfig:
-    """Create a default security configuration for testing."""
-    return SecurityConfig(
-        max_execution_time=30.0,
-        max_rows=10000,
-        safe_search_path="public",
-        readonly_role=None,
+def security_config() -> EffectivePolicy:
+    """Create a default effective policy for testing."""
+    return EffectivePolicy.merge(
+        SecurityConfig(
+            max_execution_time=30.0,
+            max_rows=10000,
+            safe_search_path="public",
+            readonly_role=None,
+        ),
+        None,
     )
 
 
 @pytest.fixture
-def security_config_with_role() -> SecurityConfig:
-    """Create security config with readonly role configured."""
-    return SecurityConfig(
-        max_execution_time=30.0,
-        max_rows=10000,
-        safe_search_path="public",
-        readonly_role="readonly_user",
-    )
-
-
-@pytest.fixture
-def db_config() -> DatabaseConfig:
-    """Create a default database configuration for testing."""
-    return DatabaseConfig(
-        host="localhost",
-        port=5432,
-        name="testdb",
-        user="testuser",
-        password="testpass",
+def security_config_with_role() -> EffectivePolicy:
+    """Create effective policy with readonly role configured."""
+    return EffectivePolicy.merge(
+        SecurityConfig(
+            max_execution_time=30.0,
+            max_rows=10000,
+            safe_search_path="public",
+            readonly_role="readonly_user",
+        ),
+        None,
     )
 
 
@@ -105,14 +100,12 @@ def mock_pool(mock_connection: MagicMock) -> MagicMock:
 @pytest.fixture
 def executor(
     mock_pool: MagicMock,
-    security_config: SecurityConfig,
-    db_config: DatabaseConfig,
+    security_config: EffectivePolicy,
 ) -> SQLExecutor:
     """Create a SQLExecutor instance with mocked dependencies."""
     return SQLExecutor(
         pool=mock_pool,
-        security_config=security_config,
-        db_config=db_config,
+        policy=security_config,
     )
 
 
@@ -254,8 +247,7 @@ class TestSQLExecutor:
     async def test_session_params_with_readonly_role(
         self,
         mock_connection: MagicMock,
-        security_config_with_role: SecurityConfig,
-        db_config: DatabaseConfig,
+        security_config_with_role: EffectivePolicy,
     ) -> None:
         """Test that readonly role is set when configured."""
         # Arrange
@@ -268,8 +260,7 @@ class TestSQLExecutor:
 
         executor = SQLExecutor(
             pool=pool,
-            security_config=security_config_with_role,
-            db_config=db_config,
+            policy=security_config_with_role,
         )
         sql = "SELECT 1"
         mock_connection.fetch.return_value = [create_mock_record({"column": 1})]
@@ -286,15 +277,17 @@ class TestSQLExecutor:
     async def test_session_params_invalid_search_path(
         self,
         mock_connection: MagicMock,
-        db_config: DatabaseConfig,
     ) -> None:
         """Test that invalid search_path is rejected."""
         # Arrange
-        malicious_config = SecurityConfig(
-            max_execution_time=30.0,
-            max_rows=10000,
-            safe_search_path="public; DROP TABLE users;--",  # SQL injection attempt
-            readonly_role=None,
+        malicious_config = EffectivePolicy.merge(
+            SecurityConfig(
+                max_execution_time=30.0,
+                max_rows=10000,
+                safe_search_path="public; DROP TABLE users;--",  # SQL injection attempt
+                readonly_role=None,
+            ),
+            None,
         )
         # Create a new pool with the mock connection
         pool = MagicMock()
@@ -305,8 +298,7 @@ class TestSQLExecutor:
 
         executor = SQLExecutor(
             pool=pool,
-            security_config=malicious_config,
-            db_config=db_config,
+            policy=malicious_config,
         )
         sql = "SELECT 1"
 
@@ -320,15 +312,17 @@ class TestSQLExecutor:
     async def test_session_params_invalid_role(
         self,
         mock_connection: MagicMock,
-        db_config: DatabaseConfig,
     ) -> None:
         """Test that invalid role name is rejected."""
         # Arrange
-        malicious_config = SecurityConfig(
-            max_execution_time=30.0,
-            max_rows=10000,
-            safe_search_path="public",
-            readonly_role="admin; DROP TABLE users;--",  # SQL injection attempt
+        malicious_config = EffectivePolicy.merge(
+            SecurityConfig(
+                max_execution_time=30.0,
+                max_rows=10000,
+                safe_search_path="public",
+                readonly_role="admin; DROP TABLE users;--",  # SQL injection attempt
+            ),
+            None,
         )
         # Create a new pool with the mock connection
         pool = MagicMock()
@@ -339,8 +333,7 @@ class TestSQLExecutor:
 
         executor = SQLExecutor(
             pool=pool,
-            security_config=malicious_config,
-            db_config=db_config,
+            policy=malicious_config,
         )
         sql = "SELECT 1"
 
@@ -358,14 +351,12 @@ class TestResultSerialization:
     def executor_for_serialization(
         self,
         mock_pool: MagicMock,
-        security_config: SecurityConfig,
-        db_config: DatabaseConfig,
+        security_config: EffectivePolicy,
     ) -> SQLExecutor:
         """Create executor for serialization tests."""
         return SQLExecutor(
             pool=mock_pool,
-            security_config=security_config,
-            db_config=db_config,
+            policy=security_config,
         )
 
     def test_serialize_datetime_types(

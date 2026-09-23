@@ -5,9 +5,9 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -94,6 +94,28 @@ class SecurityConfig(BaseSettings):
         ],
         description="List of blocked PostgreSQL functions",
     )
+    blocked_tables: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description='Blocked table names; bare ("internal") or schema-qualified ("audit.logs")',
+    )
+    blocked_columns: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description='Blocked column names; bare ("password") or table-qualified ("users.password")',
+    )
+    allow_explain: bool = Field(
+        default=False, description="Allow EXPLAIN statements (plan only, no execution)"
+    )
+    allow_explain_analyze: bool = Field(
+        default=False,
+        description="Allow EXPLAIN ANALYZE (actually executes the statement; keep off by default)",
+    )
+    block_system_catalogs: bool = Field(
+        default=False,
+        description=(
+            "Reject pg_catalog/information_schema references. Off by default: the "
+            "README example queries rely on information_schema metadata reads."
+        ),
+    )
     max_rows: int = Field(default=10000, ge=1, le=100000, description="Maximum rows to return")
     max_execution_time: float = Field(
         default=30.0, ge=1.0, le=300.0, description="Maximum query execution time in seconds"
@@ -105,9 +127,9 @@ class SecurityConfig(BaseSettings):
         default="public", description="Safe search_path to set during query execution"
     )
 
-    @field_validator("blocked_functions", mode="before")
+    @field_validator("blocked_functions", "blocked_tables", "blocked_columns", mode="before")
     @classmethod
-    def parse_blocked_functions(cls, v: str | list[str]) -> list[str]:
+    def parse_string_list(cls, v: str | list[str]) -> list[str]:
         """Parse comma-separated string or list."""
         if isinstance(v, str):
             return [f.strip() for f in v.split(",") if f.strip()]
@@ -197,6 +219,88 @@ class ObservabilityConfig(BaseSettings):
     log_format: Literal["json", "text"] = Field(default="json", description="Log format")
 
 
+class MultiDatabaseConfig(BaseSettings):
+    """Multi-database mode configuration (env prefix MULTIDB_)."""
+
+    model_config = SettingsConfigDict(env_prefix="MULTIDB_")
+
+    databases_json: str | None = Field(
+        default=None,
+        description=(
+            "JSON array of database entries, e.g. "
+            '[{"connection":{"name":"db1","host":"localhost"}},'
+            '{"connection":{"name":"db2"},"security":{"blocked_tables":["secrets"]}}]. '
+            "When set, DATABASE_* single-database variables are ignored."
+        ),
+    )
+    default_database: str | None = Field(
+        default=None,
+        description=(
+            "Database used when a request does not specify one. In single-database "
+            "mode it is auto-selected; in multi-database mode without this setting "
+            "an unspecified request is rejected."
+        ),
+    )
+
+
+class DatabaseSecurityOverride(BaseModel):
+    """Per-database security policy overrides; None fields fall back to global.
+
+    See EffectivePolicy.merge for the exact merge semantics.
+    """
+
+    blocked_tables: list[str] | None = None
+    blocked_columns: list[str] | None = None
+    allow_explain: bool | None = None
+    allow_explain_analyze: bool | None = None
+    readonly_role: str | None = None
+    safe_search_path: str | None = None
+
+
+class DatabaseConnectionParams(BaseModel):
+    """Connection parameters for one database entry.
+
+    Deliberately a plain BaseModel, NOT a BaseSettings subclass: nested
+    BaseSettings fields silently fall back to reading DATABASE_* environment
+    variables when a JSON entry omits a field, which would mix the two
+    configuration modes. JSON entries must be self-contained; missing fields
+    take the same defaults as DatabaseConfig.
+    """
+
+    host: str = Field(default="localhost", description="Database host")
+    port: int = Field(default=5432, ge=1, le=65535, description="Database port")
+    # Required (no default): a JSON entry without a name must fail validation,
+    # not silently key the runtime as "".
+    name: str = Field(min_length=1, description="Database name")
+    user: str = Field(default="postgres", description="Database user")
+    password: str = Field(default="", description="Database password")
+    min_pool_size: int = Field(default=5, ge=1, le=100, description="Minimum pool size")
+    max_pool_size: int = Field(default=20, ge=1, le=100, description="Maximum pool size")
+    pool_timeout: float = Field(
+        default=30.0, ge=1.0, le=300.0, description="Pool acquire timeout in seconds"
+    )
+    command_timeout: float = Field(
+        default=30.0, ge=1.0, le=300.0, description="Command execution timeout in seconds"
+    )
+
+    @property
+    def dsn(self) -> str:
+        """Build PostgreSQL DSN connection string."""
+        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+
+    @property
+    def safe_dsn(self) -> str:
+        """Build DSN with masked password for logging."""
+        return f"postgresql://{self.user}:***@{self.host}:{self.port}/{self.name}"
+
+
+class DatabaseEntry(BaseModel):
+    """One DATABASES_JSON array element: connection config + optional policy override."""
+
+    connection: DatabaseConnectionParams
+    security: DatabaseSecurityOverride | None = None
+
+
 class Settings(BaseSettings):
     """Main application settings aggregating all config sections."""
 
@@ -219,6 +323,79 @@ class Settings(BaseSettings):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    multidb: MultiDatabaseConfig = Field(default_factory=MultiDatabaseConfig)
+
+    # Resolved database entries, populated by model_post_init (fail-fast).
+    databases: list[DatabaseEntry] = Field(default_factory=list, exclude=True)
+
+    def model_post_init(self, __context: Any) -> None:
+        """Resolve the database entry list; any inconsistency aborts startup.
+
+        Rules (design §4.1):
+        1. MULTIDB_DATABASES_JSON unset -> single-database mode: the DATABASE_*
+           config becomes the sole entry; behavior identical to v0.2.
+        2. Set -> parse the JSON array; duplicate database names are an error;
+           DATABASE_* variables are ignored (warning logged).
+        3. MULTIDB_DEFAULT_DATABASE must name one of the entries.
+        """
+        import json as _json
+        import logging as _logging
+
+        _logger = _logging.getLogger(__name__)
+
+        raw = self.multidb.databases_json
+        if raw is None or not raw.strip():
+            self.databases = [
+                DatabaseEntry(
+                    connection=DatabaseConnectionParams(
+                        host=self.database.host,
+                        port=self.database.port,
+                        name=self.database.name,
+                        user=self.database.user,
+                        password=self.database.password,
+                        min_pool_size=self.database.min_pool_size,
+                        max_pool_size=self.database.max_pool_size,
+                        pool_timeout=self.database.pool_timeout,
+                        command_timeout=self.database.command_timeout,
+                    )
+                )
+            ]
+            if self.multidb.default_database is not None and (
+                self.multidb.default_database != self.database.name
+            ):
+                raise ValueError(
+                    f"MULTIDB_DEFAULT_DATABASE '{self.multidb.default_database}' does not "
+                    f"match the single configured database '{self.database.name}'"
+                )
+            return
+
+        try:
+            parsed = _json.loads(raw)
+        except _json.JSONDecodeError as e:
+            raise ValueError(f"MULTIDB_DATABASES_JSON is not valid JSON: {e}") from e
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError("MULTIDB_DATABASES_JSON must be a non-empty JSON array")
+
+        try:
+            self.databases = [DatabaseEntry.model_validate(item) for item in parsed]
+        except ValidationError as e:
+            raise ValueError(f"Invalid MULTIDB_DATABASES_JSON entry: {e}") from e
+
+        names = [entry.connection.name for entry in self.databases]
+        if duplicates := {n for n in names if names.count(n) > 1}:
+            raise ValueError(
+                f"Duplicate database names in MULTIDB_DATABASES_JSON: {sorted(duplicates)}"
+            )
+
+        _logger.warning(
+            "MULTIDB_DATABASES_JSON is set; DATABASE_* single-database variables are ignored"
+        )
+
+        if self.multidb.default_database is not None and self.multidb.default_database not in names:
+            raise ValueError(
+                f"MULTIDB_DEFAULT_DATABASE '{self.multidb.default_database}' is not one of "
+                f"the configured databases: {names}"
+            )
 
     @property
     def is_production(self) -> bool:

@@ -11,9 +11,74 @@ from typing import ClassVar
 import sqlglot
 from sqlglot import exp
 
-from pg_mcp.config.settings import SecurityConfig
+from pg_mcp.config.policy import EffectivePolicy
 from pg_mcp.models.errors import SecurityViolationError, SQLParseError
 from pg_mcp.models.query import ValidationResult
+
+# Statement keywords after which EXPLAIN option words end. EXPLAIN options
+# appear as leading words ("EXPLAIN ANALYZE SELECT ...") or inside parens
+# ("EXPLAIN (ANALYZE, BUFFERS) SELECT ..."). For the prefix form, leading
+# words are consumed while they name a known EXPLAIN option; the first word
+# that is not an option starts the inner statement (whatever it is — the
+# recursive validation decides whether that statement is allowed).
+_KNOWN_EXPLAIN_OPTIONS: frozenset[str] = frozenset(
+    {
+        "ANALYZE",
+        "VERBOSE",
+        "COSTS",
+        "SETTINGS",
+        "GENERIC_PLAN",
+        "BUFFERS",
+        "WAL",
+        "TIMING",
+        "SUMMARY",
+        "FORMAT",
+    }
+)
+
+_SYSTEM_CATALOG_SCHEMAS = frozenset({"pg_catalog", "information_schema"})
+
+
+def _split_explain_options(text: str) -> tuple[set[str], str]:
+    """Split EXPLAIN options from the inner statement.
+
+    Handles both PostgreSQL syntaxes:
+    - Prefix form:  "ANALYZE SELECT ..."          -> ({"ANALYZE"}, "SELECT ...")
+    - Bracket form: "(ANALYZE, BUFFERS) SELECT ..." -> ({"ANALYZE", "BUFFERS"}, "SELECT ...")
+
+    Args:
+        text: Everything after the EXPLAIN keyword.
+
+    Returns:
+        tuple: (uppercased option names, remaining inner statement text).
+    """
+    stripped = text.strip()
+
+    # Bracket option form: "OPTIONS" inner
+    if stripped.startswith("("):
+        depth = 0
+        for i, ch in enumerate(stripped):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    options = {
+                        part.strip().upper() for part in stripped[1:i].split(",") if part.strip()
+                    }
+                    return options, stripped[i + 1 :].strip()
+        # Unbalanced paren: treat everything as the statement body; the
+        # parser will reject it in the recursive validation pass.
+        return set(), stripped
+
+    # Prefix option form: consume leading words that name known options
+    tokens = stripped.split()
+    options: set[str] = set()
+    index = 0
+    while index < len(tokens) and tokens[index].upper() in _KNOWN_EXPLAIN_OPTIONS:
+        options.add(tokens[index].upper())
+        index += 1
+    return options, " ".join(tokens[index:])
 
 
 class SQLValidator:
@@ -22,9 +87,16 @@ class SQLValidator:
     This validator ensures queries are safe by:
     - Allowing only SELECT statements
     - Blocking dangerous functions (pg_sleep, file operations, etc.)
-    - Preventing access to blocked tables and columns
+    - Preventing access to blocked tables and columns (schema-qualified names
+      supported for both)
+    - Enforcing the per-database EXPLAIN / EXPLAIN ANALYZE policy, validating
+      the statement *inside* EXPLAIN
+    - Optionally rejecting pg_catalog / information_schema references
     - Rejecting multi-statement queries
     - Validating subquery safety
+
+    The validator is stateless per query and driven entirely by its
+    EffectivePolicy, so one instance per database is safe to share.
     """
 
     # Allowed statement types at the top level (including set operations)
@@ -79,30 +151,20 @@ class SQLValidator:
         "copy_to",
     }
 
-    def __init__(
-        self,
-        config: SecurityConfig,
-        blocked_tables: list[str] | None = None,
-        blocked_columns: list[str] | None = None,
-        allow_explain: bool = False,
-    ) -> None:
+    def __init__(self, policy: EffectivePolicy) -> None:
         """Initialize SQL validator.
 
         Args:
-            config: Security configuration containing blocked functions and settings.
-            blocked_tables: Optional list of table names to block access to.
-            blocked_columns: Optional list of column names to block access to.
-            allow_explain: Whether to allow EXPLAIN statements.
+            policy: The effective policy for this database (global security
+                config merged with per-database overrides).
         """
-        self.config = config
-        self.blocked_tables = {t.lower() for t in (blocked_tables or [])}
-        self.blocked_columns = {c.lower() for c in (blocked_columns or [])}
-        self.allow_explain = allow_explain
+        self.policy = policy
+        self.blocked_tables = policy.blocked_tables
+        self.blocked_columns = policy.blocked_columns
+        self.allow_explain = policy.allow_explain
 
-        # Combine built-in dangerous functions with custom blocked functions
-        self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | {
-            f.lower() for f in config.blocked_functions
-        }
+        # Combine built-in dangerous functions with configured blocked functions
+        self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | policy.blocked_functions
 
     def validate(self, sql: str) -> tuple[bool, str | None]:
         """Validate SQL query for security compliance.
@@ -159,28 +221,17 @@ class SQLValidator:
             # Check if it's an EXPLAIN command
             cmd_name = str(statement.this).upper() if statement.this else ""
             if cmd_name == "EXPLAIN":
-                if not self.allow_explain:
-                    raise SecurityViolationError("EXPLAIN statements are not allowed")
-                # EXPLAIN is read-only and safe - it only shows query plans without executing.
-                # sqlglot 28.5.0 cannot parse EXPLAIN syntax reliably (falls back to Command),
-                # so we don't attempt to validate the inner query string to avoid false positives.
-                # Even "EXPLAIN DELETE" is safe as it won't actually delete data.
-                return None
-            else:
-                # Other commands are not allowed
-                raise SecurityViolationError(
-                    f"Command '{cmd_name}' is not allowed. Only SELECT queries are permitted."
-                )
+                self._validate_explain(statement, original_sql=sql)
+                return
+            # Other commands are not allowed
+            raise SecurityViolationError(
+                f"Command '{cmd_name}' is not allowed. Only SELECT queries are permitted."
+            )
 
-        # Handle CTE (WITH) statements - extract the main query
-        if isinstance(statement, exp.With):
-            # WITH statements are allowed, but we need to validate the main query
-            if statement.this:
-                main_query = statement.this
-            else:
-                raise SQLParseError("WITH statement has no main query")
-        else:
-            main_query = statement
+        # Note: top-level WITH ... SELECT parses as exp.Select (with a "with"
+        # arg), never as a bare exp.With — CTE bodies are covered by
+        # _check_subquery_safety's whole-tree scan below.
+        main_query = statement
 
         # Perform security checks
         if error := self._check_statement_type(main_query):
@@ -195,8 +246,74 @@ class SQLValidator:
         if error := self._check_blocked_columns(statement):
             raise SecurityViolationError(error)
 
+        if error := self._check_system_catalogs(statement):
+            raise SecurityViolationError(error)
+
         if error := self._check_subquery_safety(statement):
             raise SecurityViolationError(error)
+
+    def _validate_explain(self, statement: exp.Command, original_sql: str) -> None:
+        """Validate an EXPLAIN statement, including its inner query.
+
+        EXPLAIN alone only shows a plan, but EXPLAIN ANALYZE actually
+        executes the statement, so it has a separate (default-off) switch.
+        The inner statement must pass ALL validation rules — EXPLAIN does not
+        provide a way to smuggle a forbidden statement past this validator.
+
+        Args:
+            statement: The parsed exp.Command for the EXPLAIN.
+            original_sql: The raw SQL, used as fallback for extracting the
+                inner statement text (storage location varies by sqlglot
+                version).
+
+        Raises:
+            SecurityViolationError: If EXPLAIN/ANALYZE not allowed or the
+                inner statement violates any rule.
+            SQLParseError: If the EXPLAIN has no inner query.
+        """
+        if not self.policy.allow_explain:
+            raise SecurityViolationError("EXPLAIN statements are not allowed")
+
+        inner = self._extract_explain_body(statement, original_sql)
+        options, body = _split_explain_options(inner)
+
+        if "ANALYZE" in options and not self.policy.allow_explain_analyze:
+            raise SecurityViolationError("EXPLAIN ANALYZE is not allowed")
+
+        inner = body.strip()
+        if not inner:
+            raise SQLParseError("EXPLAIN has no inner query")
+        self.validate_or_raise(inner)
+
+    @staticmethod
+    def _extract_explain_body(statement: exp.Command, original_sql: str) -> str:
+        """Get the text after the EXPLAIN keyword.
+
+        sqlglot 28.5 parses EXPLAIN as exp.Command; where it stores the rest
+        of the statement varies, so fall back to stripping the prefix from
+        the original SQL.
+
+        Args:
+            statement: The parsed EXPLAIN command node.
+            original_sql: The raw SQL text.
+
+        Returns:
+            str: Everything after the EXPLAIN keyword.
+        """
+        rest = statement.expression
+        if rest is not None:
+            if isinstance(rest, exp.Literal) and rest.is_string:
+                # sqlglot stores the post-EXPLAIN text as a string literal;
+                # .sql() would re-add surrounding quotes.
+                text = str(rest.this)
+            elif isinstance(rest, exp.Expression):
+                text = rest.sql(dialect="postgres")
+            else:
+                text = str(rest)
+            if text and text.strip():
+                return text
+        # Fallback: drop the leading EXPLAIN keyword from the raw SQL
+        return re.sub(r"^\s*EXPLAIN\b", "", original_sql, count=1, flags=re.IGNORECASE)
 
     def validate_detail(self, sql: str) -> ValidationResult:
         """Validate SQL and return a structured result without raising.
@@ -280,6 +397,10 @@ class SQLValidator:
     def _check_blocked_tables(self, statement: exp.Expression) -> str | None:
         """Check for access to blocked tables.
 
+        Matching is schema-aware: a blocked entry containing "." matches
+        "schema.table" exactly; a bare entry matches the table name in any
+        schema.
+
         Args:
             statement: Parsed SQL statement.
 
@@ -292,14 +413,25 @@ class SQLValidator:
         # Find all table references
         for table in statement.find_all(exp.Table):
             table_name = table.name.lower() if table.name else ""
+            # sqlglot: table.db is the schema part, table.catalog the database
+            full_name = f"{table.db.lower()}.{table_name}" if table.db else table_name
 
-            if table_name in self.blocked_tables:
-                return f"Access to table '{table_name}' is not allowed"
+            if table_name in self.blocked_tables or full_name in self.blocked_tables:
+                return f"Access to table '{full_name}' is not allowed"
 
         return None
 
     def _check_blocked_columns(self, statement: exp.Expression) -> str | None:
         """Check for access to blocked columns.
+
+        Matching mirrors the table rule: bare entries match the column name
+        anywhere; "table.column" entries match that qualification. An
+        unqualified column is additionally checked against every table
+        referenced by the statement (resolving aliases), so "users.password"
+        in the blocklist also catches "SELECT password FROM users". This
+        deliberately over-blocks when a column name is ambiguous across the
+        statement's tables — for a blocklist, over-blocking is the safe
+        direction.
 
         Args:
             statement: Parsed SQL statement.
@@ -310,6 +442,15 @@ class SQLValidator:
         if not self.blocked_columns:
             return None
 
+        # Collect every table name/alias so unqualified columns can be
+        # checked against table-qualified blocklist entries.
+        table_keys: set[str] = set()
+        for table in statement.find_all(exp.Table):
+            if table.name:
+                table_keys.add(table.name.lower())
+                if table.alias:
+                    table_keys.add(str(table.alias).lower())
+
         # Find all column references
         for column in statement.find_all(exp.Column):
             column_name = column.name.lower() if column.name else ""
@@ -318,16 +459,22 @@ class SQLValidator:
             if column_name in self.blocked_columns:
                 return f"Access to column '{column_name}' is not allowed"
 
-            # Check for qualified column names (table.column)
-            if column.table:
-                qualified_name = f"{column.table.lower()}.{column_name}"
+            qualifiers = {column.table.lower()} if column.table else set()
+            qualifiers |= table_keys
+            for qualifier in sorted(qualifiers):
+                qualified_name = f"{qualifier}.{column_name}"
                 if qualified_name in self.blocked_columns:
                     return f"Access to column '{qualified_name}' is not allowed"
 
         return None
 
-    def _check_subquery_safety(self, statement: exp.Expression) -> str | None:
-        """Check that all subqueries only contain SELECT statements.
+    def _check_system_catalogs(self, statement: exp.Expression) -> str | None:
+        """Reject pg_catalog / information_schema references when enabled.
+
+        Opt-in (EffectivePolicy.block_system_catalogs, default off): the
+        documented example queries read information_schema metadata, and
+        with a fixed search_path plus read-only transactions the exposure
+        from metadata reads is limited.
 
         Args:
             statement: Parsed SQL statement.
@@ -335,20 +482,40 @@ class SQLValidator:
         Returns:
             Error message if check fails, None otherwise.
         """
-        # Find all subqueries
+        if not self.policy.block_system_catalogs:
+            return None
+
+        for table in statement.find_all(exp.Table):
+            schema_name = table.db.lower() if table.db else ""
+            if schema_name in _SYSTEM_CATALOG_SCHEMAS:
+                return f"Access to system catalog '{schema_name}.{table.name}' is not allowed"
+
+        return None
+
+    def _check_subquery_safety(self, statement: exp.Expression) -> str | None:
+        """Check that no nested statement violates the read-only constraint.
+
+        Covers every nesting form, including data-modifying CTEs
+        ("WITH d AS (DELETE ...) SELECT ...") and FROM-subqueries.
+
+        Args:
+            statement: Parsed SQL statement.
+
+        Returns:
+            Error message if check fails, None otherwise.
+        """
+        # A forbidden node anywhere in the tree (CTE bodies included) makes
+        # the whole statement unsafe.
+        for node in statement.walk():
+            if isinstance(node, tuple(self.FORBIDDEN_STATEMENT_TYPES)):
+                stmt_name = type(node).__name__.upper()
+                return f"{stmt_name} statements are not allowed in any part of the query"
+
+        # FROM-subqueries must contain a query (SELECT/UNION/...). Note UNION
+        # is exp.Union, not exp.Select — exp.Query covers both.
         for subquery in statement.find_all(exp.Subquery):
-            if subquery.this:
-                inner_stmt = subquery.this
-
-                # Check if the inner statement is a forbidden type
-                for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
-                    if isinstance(inner_stmt, forbidden_type):
-                        stmt_name = forbidden_type.__name__.upper()
-                        return f"{stmt_name} statements in subqueries are not allowed"
-
-                # Ensure it's a SELECT
-                if not isinstance(inner_stmt, (exp.Select, exp.With)):
-                    return "Subqueries must contain only SELECT statements"
+            if subquery.this and not isinstance(subquery.this, exp.Query):
+                return "Subqueries must contain only SELECT statements"
 
         return None
 

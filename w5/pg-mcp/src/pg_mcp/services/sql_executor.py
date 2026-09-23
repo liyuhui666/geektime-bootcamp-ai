@@ -13,7 +13,7 @@ from typing import Any
 import asyncpg
 from asyncpg import Connection, Pool
 
-from pg_mcp.config.settings import DatabaseConfig, SecurityConfig
+from pg_mcp.config.policy import EffectivePolicy
 from pg_mcp.models.errors import DatabaseError, ExecutionTimeoutError
 from pg_mcp.observability.metrics import MetricsCollector
 
@@ -27,8 +27,11 @@ class SQLExecutor:
     3. Limiting the number of returned rows
     4. Serializing PostgreSQL-specific data types
 
+    All limits come from the database's EffectivePolicy, so one executor per
+    database enforces exactly that database's merged policy.
+
     Example:
-        >>> executor = SQLExecutor(pool, security_config, db_config)
+        >>> executor = SQLExecutor(pool, policy)
         >>> results, count = await executor.execute("SELECT * FROM users")
         >>> print(f"Retrieved {count} rows")
     """
@@ -36,8 +39,7 @@ class SQLExecutor:
     def __init__(
         self,
         pool: Pool,
-        security_config: SecurityConfig,
-        db_config: DatabaseConfig,
+        policy: EffectivePolicy,
         database_name: str = "unknown",
         metrics: MetricsCollector | None = None,
     ) -> None:
@@ -45,15 +47,14 @@ class SQLExecutor:
 
         Args:
             pool: asyncpg connection pool for database connections.
-            security_config: Security configuration including timeouts and limits.
-            db_config: Database configuration including connection parameters.
+            policy: Effective security policy (row limits, timeouts,
+                search_path, readonly role) for this database.
             database_name: Name of the database this executor serves, used for
                 error metric labels.
             metrics: Optional metrics collector (None-safe for tests).
         """
         self.pool = pool
-        self.security_config = security_config
-        self.db_config = db_config
+        self.policy = policy
         self.database_name = database_name
         self.metrics = metrics
 
@@ -96,8 +97,8 @@ class SQLExecutor:
             >>> print(f"Retrieved {len(results)} of {count} total rows")
         """
         # Use configured defaults if not specified
-        timeout = timeout or self.security_config.max_execution_time
-        max_rows = max_rows or self.security_config.max_rows
+        timeout = timeout or self.policy.max_execution_time
+        max_rows = max_rows or self.policy.max_rows
 
         try:
             async with (
@@ -197,7 +198,7 @@ class SQLExecutor:
 
             # Set safe search_path to prevent schema injection
             # Using execute with literal to avoid SQL injection
-            search_path = self.security_config.safe_search_path
+            search_path = self.policy.safe_search_path
             # Validate search_path contains only safe characters
             if not all(c.isalnum() or c in ("_", ",", " ") for c in search_path):
                 raise DatabaseError(
@@ -207,8 +208,8 @@ class SQLExecutor:
             await conn.execute(f"SET search_path = '{search_path}'")
 
             # Switch to read-only role if configured
-            if self.security_config.readonly_role:
-                readonly_role = self.security_config.readonly_role
+            if self.policy.readonly_role:
+                readonly_role = self.policy.readonly_role
                 # Validate role name contains only safe characters
                 if not all(c.isalnum() or c == "_" for c in readonly_role):
                     raise DatabaseError(
@@ -223,8 +224,8 @@ class SQLExecutor:
                 details={
                     "error_code": e.sqlstate if hasattr(e, "sqlstate") else None,
                     "timeout_ms": timeout_ms,
-                    "search_path": self.security_config.safe_search_path,
-                    "readonly_role": self.security_config.readonly_role,
+                    "search_path": self.policy.safe_search_path,
+                    "readonly_role": self.policy.readonly_role,
                 },
             ) from e
 

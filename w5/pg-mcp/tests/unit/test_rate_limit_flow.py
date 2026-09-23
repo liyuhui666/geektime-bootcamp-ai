@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from pg_mcp.config.settings import ResilienceConfig, ValidationConfig
+from pg_mcp.config.policy import EffectivePolicy
+from pg_mcp.config.settings import ResilienceConfig, SecurityConfig, ValidationConfig
+from pg_mcp.db.runtime import DatabaseRuntime
 from pg_mcp.models.errors import (
     LLMResponseError,
     LLMTimeoutError,
@@ -57,13 +59,19 @@ def _make_orchestrator(
     val.validate_or_raise.return_value = None
     val.validate_detail.return_value = _valid_detail()
 
+    runtime = DatabaseRuntime(
+        name="db",
+        pool=MagicMock(),
+        executor=AsyncMock(),
+        validator=val,
+        policy=EffectivePolicy.merge(SecurityConfig(), None),
+    )
+
     return QueryOrchestrator(
+        runtimes={"db": runtime},
         sql_generator=gen,
-        sql_validator=val,
-        sql_executor=AsyncMock(),
         result_validator=MagicMock(),
         schema_cache=MagicMock(),
-        pools={"db": MagicMock()},
         resilience_config=ResilienceConfig(
             max_retries=max_retries,
             retry_delay=0.1,
@@ -129,7 +137,12 @@ class TestLLMSlot:
         orch = _make_orchestrator(generator=gen, rate_limiter=rl, max_retries=2)
 
         with pytest.raises(RateLimitExceededError):
-            await orch._generate_sql_with_retry(question="q", schema=MagicMock(), request_id="r")
+            await orch._generate_sql_with_retry(
+                question="q",
+                schema=MagicMock(),
+                request_id="r",
+                validator=orch.runtimes["db"].validator,
+            )
 
         # The failure happened before any LLM call: budget untouched
         assert gen.generate.call_count == 0
@@ -157,7 +170,10 @@ class TestRetryBackoffFlow:
         orch = _make_orchestrator(generator=gen, max_retries=2)
 
         sql, _validation, _tokens = await orch._generate_sql_with_retry(
-            question="q", schema=MagicMock(), request_id="r"
+            question="q",
+            schema=MagicMock(),
+            request_id="r",
+            validator=orch.runtimes["db"].validator,
         )
 
         assert sql == "SELECT 1;"
@@ -185,7 +201,10 @@ class TestRetryBackoffFlow:
         orch = _make_orchestrator(generator=gen, max_retries=2)
 
         sql, _validation, _tokens = await orch._generate_sql_with_retry(
-            question="q", schema=MagicMock(), request_id="r"
+            question="q",
+            schema=MagicMock(),
+            request_id="r",
+            validator=orch.runtimes["db"].validator,
         )
 
         assert sql == "SELECT 2;"
@@ -208,7 +227,12 @@ class TestRetryBackoffFlow:
         orch = _make_orchestrator(generator=gen, max_retries=3)
 
         with pytest.raises(LLMUnavailableError):
-            await orch._generate_sql_with_retry(question="q", schema=MagicMock(), request_id="r")
+            await orch._generate_sql_with_retry(
+                question="q",
+                schema=MagicMock(),
+                request_id="r",
+                validator=orch.runtimes["db"].validator,
+            )
 
         assert gen.generate.call_count == 1
         assert orch.circuit_breaker.failure_count == 1
@@ -230,7 +254,10 @@ class TestRetryBackoffFlow:
         orch = _make_orchestrator(generator=gen, max_retries=2)
 
         sql, _validation, _tokens = await orch._generate_sql_with_retry(
-            question="q", schema=MagicMock(), request_id="r"
+            question="q",
+            schema=MagicMock(),
+            request_id="r",
+            validator=orch.runtimes["db"].validator,
         )
 
         assert sql == "SELECT 3;"
@@ -257,7 +284,12 @@ class TestRetryBackoffFlow:
         orch = _make_orchestrator(generator=gen, max_retries=2)
 
         with pytest.raises(LLMTimeoutError):
-            await orch._generate_sql_with_retry(question="q", schema=MagicMock(), request_id="r")
+            await orch._generate_sql_with_retry(
+                question="q",
+                schema=MagicMock(),
+                request_id="r",
+                validator=orch.runtimes["db"].validator,
+            )
 
         # max_retries=2 -> at most 3 total LLM calls
         assert gen.generate.call_count == 3

@@ -4,7 +4,7 @@
 |---|---|
 | 文档编号 | specs/w5/0009 |
 | 关联文档 | 0001-prd、0002-design、0006-code-review（codex review 缺失项来源）、0007-test-plan |
-| 状态 | Draft v2（已自查修订，见附录 C）→ 待评审 |
+| 状态 | 已实现（P0–P3 全部落地，实施记录见附录 D） |
 | 目标版本 | v0.3.0 |
 | 读者 | 实现工程师、代码评审者、课程作业评审 |
 
@@ -638,3 +638,42 @@ async def generate(...) -> GenerationResult:   # 签名变更，调用方仅 orc
 | 8 | 一致性 | 接口残留未列全（orchestrator pools 参数 / executor 缺 database_name / validator 构造签名） | 实施时遗漏会产生死参数或缺 label 数据源 | §4.4 接口清理清单 |
 
 **需求覆盖结论**：作业三项要求（多数据库与安全控制 / 弹性与可观测性整合 / 响应模型缺陷与测试覆盖）均已由 F1（§4）、F2（§5）、F3（§6）+ 测试设计（§7）覆盖，追溯映射见附录 A。
+
+---
+
+## 13. 附录 D：实施记录（P0–P3 完成情况与偏差）
+
+四个阶段均已实现并分阶段提交（P0/P1：`edcd667`；P2：`f7913e0`；P3：见 git log）。以下为与设计的偏差及实现中额外发现的问题，供评审对照。
+
+### 13.1 实现中额外发现并修复的安全问题
+
+| # | 问题 | 处理 |
+|---|---|---|
+| D1 | 数据修改型 CTE 被放行：`WITH d AS (DELETE FROM users) SELECT * FROM d` 通过原校验（子查询检查只扫 `exp.Subquery`，CTE 体不在其中） | `_check_subquery_safety` 改为整棵语法树扫描 FORBIDDEN 类型，任意位置出现写操作/DDL/命令即拒绝 |
+| D2 | UNION 子查询被误拒：`(SELECT 1 UNION SELECT 2)` 的内层是 `exp.Union`，不是 `exp.Select`，原"子查询必须是 SELECT"检查把合法只读 SQL 拒绝 | 内层类型判断改用 `exp.Query`（Select/Union 共同基类） |
+| D3 | `DatabaseConnectionParams.name` 原设计为 `default=""` + `min_length=1`：pydantic v2 默认值不走字段校验，JSON 条目缺 `name` 会静默变成空字符串 | `name` 改为必填字段（无默认值），缺失即启动失败 |
+
+### 13.2 与设计文本的偏差
+
+| # | 偏差 | 理由 |
+|---|---|---|
+| D4 | `blocked_columns` 表限定条目（如 `users.password`）的匹配在解析后按语句内表名/别名集合解析后再比对；无歧义时精确匹配，有歧义时宁可多拦（over-blocking） | 黑名单方向的安全选择：误拒好于漏放；已用单测锁定行为（别名、JOIN、WHERE 场景） |
+| D5 | 顶层 `exp.With` 特判被删除 | sqlglot 28.5 顶层 `WITH ... SELECT` 解析为 `exp.Select`（with arg），原分支不可达（死代码） |
+| D6 | `db/runtime.py` 对 services 层的导入延迟到 `DatabaseManager.build()` 函数体内 | `services.orchestrator` 需要反向导入 `DatabaseRuntime`，模块级导入成环 |
+| D7 | `EXPLAIN` 内层语句采用完整递归校验（`validate_or_raise(inner)`），比 §4.5 "内层需过全部规则"更进一步 | 复用同一套规则天然覆盖黑名单/目录/子查询检查，避免两套判断漂移 |
+
+### 13.3 质量门实测值（P3 提交前）
+
+| 指标 | 要求 | 实测 |
+|---|---|---|
+| 单元测试 | 全部通过 | 396 passed（P2 结束时 292） |
+| sql_validator 覆盖率 | ≥ 95% | 95% |
+| 总体覆盖率 | ≥ 80% | 83% |
+| 新增安全模块（policy / runtime / pool / tracing） | — | 96%–100% |
+| ruff check / format | 无告警 | 通过 |
+
+### 13.4 遗留事项
+
+- `MULTIDB_DATABASES_JSON` 环境变量在 Windows 下受环境块 32KB 限制（见 §11 R4），库数量极多时需改为配置文件挂载（v0.4 候选）
+- `trace_async` / `trace_sync` 装饰器已标记 deprecated（改用 `request_context()`），计划 v0.4 移除
+- server lifespan 的集成路径（真实 PostgreSQL 连接）由 `tests/integration/` 覆盖，需要真实数据库，不在单元测试门内

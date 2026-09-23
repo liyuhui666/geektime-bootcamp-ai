@@ -4,11 +4,14 @@ This module tests the orchestrator's coordination of the query pipeline,
 including retry logic, error handling, and integration with all components.
 """
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from pg_mcp.config.settings import ResilienceConfig, ValidationConfig
+from pg_mcp.config.policy import EffectivePolicy
+from pg_mcp.config.settings import ResilienceConfig, SecurityConfig, ValidationConfig
+from pg_mcp.db.runtime import DatabaseRuntime
 from pg_mcp.models.errors import (
     DatabaseError,
     LLMError,
@@ -43,6 +46,40 @@ def _valid_validation_result() -> ValidationResult:
     )
 
 
+def _orchestrator(
+    *,
+    sql_validator: MagicMock | None = None,
+    sql_executor: AsyncMock | MagicMock | None = None,
+    pools: dict[str, MagicMock] | None = None,
+    default_database: str | None = None,
+    **kwargs: Any,
+) -> QueryOrchestrator:
+    """Build a QueryOrchestrator with per-database runtimes from simple mocks.
+
+    All runtimes share the given validator/executor mocks, mirroring the
+    pre-runtimes tests where a single validator/executor was wired in.
+    """
+    names = list(pools.keys()) if pools is not None else ["test_db"]
+    validator = sql_validator if sql_validator is not None else MagicMock()
+    executor = sql_executor if sql_executor is not None else AsyncMock()
+    runtimes = {
+        name: DatabaseRuntime(
+            name=name,
+            pool=pools[name] if pools is not None else MagicMock(),
+            validator=validator,
+            executor=executor,
+            policy=EffectivePolicy.merge(SecurityConfig(), None),
+        )
+        for name in names
+    }
+    kwargs.setdefault("sql_generator", AsyncMock())
+    kwargs.setdefault("result_validator", MagicMock())
+    kwargs.setdefault("schema_cache", MagicMock())
+    kwargs.setdefault("resilience_config", ResilienceConfig(retry_delay=0.1))
+    kwargs.setdefault("validation_config", ValidationConfig())
+    return QueryOrchestrator(runtimes=runtimes, default_database=default_database, **kwargs)
+
+
 class TestDatabaseResolution:
     """Test database name resolution logic."""
 
@@ -57,7 +94,7 @@ class TestDatabaseResolution:
     @pytest.fixture
     def orchestrator(self, mock_pools: dict[str, MagicMock]) -> QueryOrchestrator:
         """Create orchestrator with mocked components."""
-        return QueryOrchestrator(
+        return _orchestrator(
             sql_generator=MagicMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -84,7 +121,7 @@ class TestDatabaseResolution:
 
     def test_resolve_database_auto_select_single(self) -> None:
         """Test auto-selecting when only one database available."""
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=MagicMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -110,7 +147,7 @@ class TestDatabaseResolution:
 
     def test_resolve_database_no_databases(self) -> None:
         """Test error when no databases configured."""
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=MagicMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -125,6 +162,31 @@ class TestDatabaseResolution:
             orchestrator._resolve_database(None)
 
         assert "no databases configured" in str(exc_info.value).lower()
+
+    def test_default_database_used_when_unspecified(self) -> None:
+        """With multiple databases, the configured default is used."""
+        orchestrator = _orchestrator(
+            pools={"db1": MagicMock(), "db2": MagicMock()},
+            default_database="db2",
+        )
+        assert orchestrator._resolve_database(None) == "db2"
+
+    def test_default_database_unknown_rejected(self) -> None:
+        """A default naming no configured database falls through to reject."""
+        orchestrator = _orchestrator(
+            pools={"db1": MagicMock(), "db2": MagicMock()},
+            default_database="ghost",
+        )
+        with pytest.raises(DatabaseError) as exc_info:
+            orchestrator._resolve_database(None)
+        assert "specify" in str(exc_info.value).lower()
+
+    def test_explicit_request_overrides_default(self) -> None:
+        orchestrator = _orchestrator(
+            pools={"db1": MagicMock(), "db2": MagicMock()},
+            default_database="db2",
+        )
+        assert orchestrator._resolve_database("db1") == "db1"
 
 
 class TestSQLGenerationWithRetry:
@@ -168,7 +230,7 @@ class TestSQLGenerationWithRetry:
         mock_validator.validate_or_raise.return_value = None  # No exception = valid
         mock_validator.validate_detail.return_value = _valid_validation_result()
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=MagicMock(),
@@ -184,6 +246,7 @@ class TestSQLGenerationWithRetry:
             question="Get all users",
             schema=mock_schema,
             request_id="test-123",
+            validator=orchestrator.runtimes["test_db"].validator,
         )
 
         # Verify
@@ -213,7 +276,7 @@ class TestSQLGenerationWithRetry:
         ]
         mock_validator.validate_detail.return_value = _valid_validation_result()
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=MagicMock(),
@@ -229,6 +292,7 @@ class TestSQLGenerationWithRetry:
             question="Get all users",
             schema=mock_schema,
             request_id="test-123",
+            validator=orchestrator.runtimes["test_db"].validator,
         )
 
         # Verify
@@ -254,7 +318,7 @@ class TestSQLGenerationWithRetry:
             "DELETE statements are not allowed"
         )
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=MagicMock(),
@@ -271,6 +335,7 @@ class TestSQLGenerationWithRetry:
                 question="Delete all users",
                 schema=mock_schema,
                 request_id="test-123",
+                validator=orchestrator.runtimes["test_db"].validator,
             )
 
         assert "DELETE statements are not allowed" in str(exc_info.value)
@@ -281,7 +346,7 @@ class TestSQLGenerationWithRetry:
     @pytest.mark.asyncio
     async def test_generate_sql_circuit_breaker_open(self, mock_schema: DatabaseSchema) -> None:
         """Test that open circuit breaker prevents SQL generation."""
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=AsyncMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -302,6 +367,7 @@ class TestSQLGenerationWithRetry:
                 question="Get all users",
                 schema=mock_schema,
                 request_id="test-123",
+                validator=orchestrator.runtimes["test_db"].validator,
             )
 
         assert "temporarily unavailable" in str(exc_info.value).lower()
@@ -313,7 +379,7 @@ class TestSQLGenerationWithRetry:
         mock_generator = AsyncMock()
         mock_generator.generate.side_effect = RuntimeError("Unexpected error")
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -329,6 +395,7 @@ class TestSQLGenerationWithRetry:
                 question="Get all users",
                 schema=mock_schema,
                 request_id="test-123",
+                validator=orchestrator.runtimes["test_db"].validator,
             )
 
         assert "unexpectedly" in str(exc_info.value).lower()
@@ -349,7 +416,7 @@ class TestResultValidation:
             is_acceptable=True,
         )
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=MagicMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -376,7 +443,7 @@ class TestResultValidation:
         """Test that validation is skipped when disabled."""
         mock_validator = AsyncMock()
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=MagicMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -404,7 +471,7 @@ class TestResultValidation:
         mock_validator = AsyncMock()
         mock_validator.validate.side_effect = Exception("Validation failed")
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=MagicMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -471,7 +538,7 @@ class TestExecuteQueryFlow:
         mock_cache = MagicMock()
         mock_cache.get.return_value = mock_schema
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=MagicMock(),
@@ -529,7 +596,7 @@ class TestExecuteQueryFlow:
         mock_cache = MagicMock()
         mock_cache.get.return_value = mock_schema
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=mock_executor,
@@ -581,7 +648,7 @@ class TestExecuteQueryFlow:
 
         mock_pool = MagicMock()
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=MagicMock(),
@@ -612,7 +679,7 @@ class TestExecuteQueryFlow:
         mock_cache.get.return_value = None
         mock_cache.load = AsyncMock(side_effect=Exception("DB connection failed"))
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=MagicMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -656,7 +723,7 @@ class TestExecuteQueryFlow:
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.side_effect = SecurityViolationError("DELETE not allowed")
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=MagicMock(),
@@ -698,7 +765,7 @@ class TestExecuteQueryFlow:
         mock_executor = AsyncMock()
         mock_executor.execute.side_effect = DatabaseError("Query execution failed")
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=mock_executor,
@@ -730,7 +797,7 @@ class TestExecuteQueryFlow:
         mock_cache = MagicMock()
         mock_cache.get.side_effect = RuntimeError("Unexpected error")
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=MagicMock(),
             sql_validator=MagicMock(),
             sql_executor=MagicMock(),
@@ -769,7 +836,7 @@ class TestExecuteQueryFlow:
         mock_validator.validate_or_raise.return_value = None
         mock_validator.validate_detail.return_value = _valid_validation_result()
 
-        orchestrator = QueryOrchestrator(
+        orchestrator = _orchestrator(
             sql_generator=mock_generator,
             sql_validator=mock_validator,
             sql_executor=MagicMock(),
@@ -809,7 +876,7 @@ class TestQuestionLengthLimit:
             "validation_config": ValidationConfig(),
         }
         kwargs.update(overrides)
-        return QueryOrchestrator(**kwargs)
+        return _orchestrator(**kwargs)
 
     @pytest.mark.asyncio
     async def test_question_exceeding_config_limit_rejected(self) -> None:

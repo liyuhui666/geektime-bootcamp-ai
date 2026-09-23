@@ -9,12 +9,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from asyncpg import Pool
 from mcp.server.fastmcp import FastMCP
 
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import Settings
-from pg_mcp.db.pool import close_pools, create_pool
+from pg_mcp.db.pool import close_pools
+from pg_mcp.db.runtime import DatabaseManager, DatabaseRuntime
 from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
@@ -22,15 +22,13 @@ from pg_mcp.observability.tracing import request_context
 from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.orchestrator import QueryOrchestrator
 from pg_mcp.services.result_validator import ResultValidator
-from pg_mcp.services.sql_executor import SQLExecutor
 from pg_mcp.services.sql_generator import SQLGenerator
-from pg_mcp.services.sql_validator import SQLValidator
 
 logger = get_logger(__name__)
 
 # Global state for lifespan management
 _settings: Settings | None = None
-_pools: dict[str, Pool] | None = None
+_runtimes: dict[str, DatabaseRuntime] = {}
 _schema_cache: SchemaCache | None = None
 _orchestrator: QueryOrchestrator | None = None
 _metrics: MetricsCollector | None = None
@@ -67,7 +65,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         ...     # Server is running with all components initialized
         ...     pass
     """
-    global _settings, _pools, _schema_cache, _orchestrator, _metrics
+    global _settings, _runtimes, _schema_cache, _orchestrator, _metrics
     global _rate_limiter
 
     logger.info("Starting PostgreSQL MCP Server initialization...")
@@ -90,32 +88,24 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             extra={
                 "environment": _settings.environment,
                 "log_level": _settings.observability.log_level,
+                "databases": [entry.connection.name for entry in _settings.databases],
             },
         )
 
-        # 3. Create database connection pools
-        logger.info("Creating database connection pools...")
-        _pools = {}
-        # Note: For single database configuration, we use the main database config
-        pool = await create_pool(_settings.database)
-        _pools[_settings.database.name] = pool
-        logger.info(
-            f"Created connection pool for database '{_settings.database.name}'",
-            extra={
-                "min_size": _settings.database.min_pool_size,
-                "max_size": _settings.database.max_pool_size,
-            },
-        )
+        # 3. Build per-database runtimes (pools + policy-bound validators and
+        # executors). Fail-fast: any connection error aborts startup.
+        logger.info("Creating database runtimes...")
+        _runtimes = await DatabaseManager.build(_settings)
 
         # 4. Load Schema cache
         logger.info("Initializing schema cache...")
         _schema_cache = SchemaCache(_settings.cache)
 
-        for db_name, pool in _pools.items():
-            logger.info(f"Loading schema for database '{db_name}'...")
-            schema = await _schema_cache.load(db_name, pool)
+        for rt in _runtimes.values():
+            logger.info(f"Loading schema for database '{rt.name}'...")
+            schema = await _schema_cache.load(rt.name, rt.pool)
             logger.info(
-                f"Schema loaded for '{db_name}'",
+                f"Schema loaded for '{rt.name}'",
                 extra={
                     "tables": len(schema.tables),
                 },
@@ -128,7 +118,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         #     logger.info("Starting schema auto-refresh...")
         #     await _schema_cache.start_auto_refresh(
         #         interval_minutes=60,  # Refresh every hour
-        #         pools=_pools,
+        #         pools={name: rt.pool for name, rt in _runtimes.items()},
         #     )
 
         # 5. Initialize metrics collector
@@ -142,32 +132,11 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             start_http_server(_settings.observability.metrics_port)
             logger.info(f"Metrics server started on port {_settings.observability.metrics_port}")
 
-        # 6. Create service components
+        # 6. Create LLM-backed service components (shared across databases)
         logger.info("Initializing service components...")
 
         # SQL Generator
         sql_generator = SQLGenerator(_settings.openai)
-
-        # SQL Validator
-        sql_validator = SQLValidator(
-            config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
-        )
-
-        # SQL Executor (create one per database)
-        sql_executors: dict[str, SQLExecutor] = {}
-        for db_name, pool in _pools.items():
-            executor = SQLExecutor(
-                pool=pool,
-                security_config=_settings.security,
-                db_config=_settings.database,
-                database_name=db_name,
-                metrics=_metrics,
-            )
-            sql_executors[db_name] = executor
-            logger.info(f"Created SQL executor for database '{db_name}'")
 
         # Result Validator
         result_validator = ResultValidator(
@@ -189,23 +158,23 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # 8. Create QueryOrchestrator
         logger.info("Creating query orchestrator...")
         _orchestrator = QueryOrchestrator(
+            runtimes=_runtimes,
             sql_generator=sql_generator,
-            sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
             result_validator=result_validator,
             schema_cache=_schema_cache,
-            pools=_pools,
             resilience_config=_settings.resilience,
             validation_config=_settings.validation,
             rate_limiter=_rate_limiter,
             metrics=_metrics,
+            default_database=_settings.multidb.default_database,
         )
 
         logger.info("PostgreSQL MCP Server initialization complete!")
         logger.info(
             "Server ready to accept requests",
             extra={
-                "databases": list(_pools.keys()),
+                "databases": list(_runtimes.keys()),
+                "default_database": _settings.multidb.default_database,
                 "cache_enabled": _settings.cache.enabled,
                 "metrics_enabled": _settings.observability.metrics_enabled,
             },
@@ -231,10 +200,10 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
                 logger.warning(f"Error stopping schema auto-refresh: {e!s}")
 
         # Close database connection pools with timeout
-        if _pools is not None:
+        if _runtimes:
             try:
                 # Use 5 second timeout for graceful shutdown
-                await close_pools(_pools, timeout=5.0)
+                await close_pools({name: rt.pool for name, rt in _runtimes.items()}, timeout=5.0)
                 logger.info("Database connection pools closed")
             except Exception as e:
                 logger.error(f"Error closing connection pools: {e!s}")

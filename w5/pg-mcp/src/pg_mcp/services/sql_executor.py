@@ -15,6 +15,7 @@ from asyncpg import Connection, Pool
 
 from pg_mcp.config.settings import DatabaseConfig, SecurityConfig
 from pg_mcp.models.errors import DatabaseError, ExecutionTimeoutError
+from pg_mcp.observability.metrics import MetricsCollector
 
 
 class SQLExecutor:
@@ -37,6 +38,8 @@ class SQLExecutor:
         pool: Pool,
         security_config: SecurityConfig,
         db_config: DatabaseConfig,
+        database_name: str = "unknown",
+        metrics: MetricsCollector | None = None,
     ) -> None:
         """Initialize SQL executor.
 
@@ -44,10 +47,15 @@ class SQLExecutor:
             pool: asyncpg connection pool for database connections.
             security_config: Security configuration including timeouts and limits.
             db_config: Database configuration including connection parameters.
+            database_name: Name of the database this executor serves, used for
+                error metric labels.
+            metrics: Optional metrics collector (None-safe for tests).
         """
         self.pool = pool
         self.security_config = security_config
         self.db_config = db_config
+        self.database_name = database_name
+        self.metrics = metrics
 
     async def execute(
         self,
@@ -133,11 +141,18 @@ class SQLExecutor:
             # Re-raise timeout errors as-is
             raise
         except asyncpg.PostgresError as e:
+            # Classify by SQLSTATE class (first two characters, e.g. "28"
+            # privilege violation, "42" syntax/access error) for metrics
+            sqlstate = getattr(e, "sqlstate", None)
+            if self.metrics is not None:
+                self.metrics.increment_database_error(
+                    self.database_name, (sqlstate or "unknown")[:2]
+                )
             # Wrap PostgreSQL errors
             raise DatabaseError(
                 message=f"Database query failed: {e!s}",
                 details={
-                    "error_code": e.sqlstate if hasattr(e, "sqlstate") else None,
+                    "error_code": sqlstate,
                     "error_message": str(e),
                     "sql": sql[:200],  # Include truncated SQL for debugging
                 },

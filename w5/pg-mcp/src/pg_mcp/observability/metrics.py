@@ -4,7 +4,9 @@ This module implements comprehensive metrics collection using prometheus_client,
 tracking query requests, LLM calls, database operations, and system health.
 """
 
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+import contextlib
+
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram, start_http_server
 
 
 class MetricsCollector:
@@ -59,7 +61,7 @@ class MetricsCollector:
         self.llm_calls: Counter = Counter(
             "pg_mcp_llm_calls_total",
             "Total number of LLM API calls",
-            labelnames=["operation"],
+            labelnames=["operation", "status"],
         )
 
         self.llm_latency: Histogram = Histogram(
@@ -80,6 +82,37 @@ class MetricsCollector:
             "pg_mcp_sql_rejected_total",
             "Total number of SQL queries rejected by security checks",
             labelnames=["reason"],
+        )
+
+        # Pipeline / resilience metrics (F2)
+        self.sql_generation_duration: Histogram = Histogram(
+            "pg_mcp_sql_generation_duration_seconds",
+            "SQL generation call duration in seconds",
+            labelnames=["attempt"],
+            buckets=(0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0),
+        )
+
+        self.sql_validation_failures: Counter = Counter(
+            "pg_mcp_sql_validation_failures_total",
+            "Total number of SQL validation failures in the retry loop",
+            labelnames=["reason"],
+        )
+
+        self.database_errors: Counter = Counter(
+            "pg_mcp_database_errors_total",
+            "Total number of database errors by SQLSTATE class",
+            labelnames=["database", "sqlstate_class"],
+        )
+
+        self.circuit_breaker_state: Gauge = Gauge(
+            "pg_mcp_circuit_breaker_state",
+            "LLM circuit breaker state (0=closed, 1=half_open, 2=open)",
+        )
+
+        self.rate_limiter_active: Gauge = Gauge(
+            "pg_mcp_rate_limiter_active",
+            "Currently held rate limiter slots",
+            labelnames=["type"],
         )
 
         # Database Metrics
@@ -124,13 +157,14 @@ class MetricsCollector:
         """
         self.query_requests.labels(status=status, database=database).inc()
 
-    def increment_llm_call(self, operation: str) -> None:
+    def increment_llm_call(self, operation: str, status: str = "success") -> None:
         """Increment LLM call counter.
 
         Args:
-            operation: Type of LLM operation (generate_sql, validate_result, etc.)
+            operation: Type of LLM operation (generation, validation).
+            status: Call outcome (success, error).
         """
-        self.llm_calls.labels(operation=operation).inc()
+        self.llm_calls.labels(operation=operation, status=status).inc()
 
     def observe_llm_latency(self, operation: str, duration: float) -> None:
         """Record LLM call latency.
@@ -184,14 +218,86 @@ class MetricsCollector:
         """
         self.schema_cache_age.labels(database=database).set(age_seconds)
 
+    def observe_sql_generation_duration(self, attempt: int, duration: float) -> None:
+        """Record SQL generation call duration.
+
+        Args:
+            attempt: Zero-based generation attempt index.
+            duration: Duration in seconds.
+        """
+        self.sql_generation_duration.labels(attempt=str(attempt)).observe(duration)
+
+    def increment_sql_validation_failure(self, reason: str) -> None:
+        """Increment SQL validation failure counter.
+
+        Args:
+            reason: Failure class ("security" or "parse").
+        """
+        self.sql_validation_failures.labels(reason=reason).inc()
+
+    def increment_database_error(self, database: str, sqlstate_class: str) -> None:
+        """Increment database error counter.
+
+        Args:
+            database: Database name.
+            sqlstate_class: Two-character SQLSTATE class code (e.g. "28" for
+                privilege violations), or "unknown" when unavailable.
+        """
+        self.database_errors.labels(database=database, sqlstate_class=sqlstate_class).inc()
+
+    def set_circuit_breaker_state(self, state: str) -> None:
+        """Publish circuit breaker state as a numeric gauge.
+
+        Args:
+            state: Breaker state name ("closed", "half_open", "open").
+        """
+        self.circuit_breaker_state.set(
+            {"closed": 0, "half_open": 1, "open": 2}.get(state.lower(), 0)
+        )
+
+    def set_rate_limiter_active(self, limiter_type: str, count: int) -> None:
+        """Set currently-held slots for a rate limiter.
+
+        Args:
+            limiter_type: Limiter name ("queries" or "llm").
+            count: Number of currently held slots.
+        """
+        self.rate_limiter_active.labels(type=limiter_type).set(count)
+
     def reset_all_metrics(self) -> None:
         """Reset all metrics to initial state.
 
-        This method is primarily useful for testing purposes.
+        Prometheus collectors register globally and cannot simply be
+        recreated (name collision), so the old collectors are unregistered
+        first. Primarily useful for test isolation.
         """
-        # Note: Prometheus client doesn't provide a clean way to reset metrics
-        # This is mainly for testing - in production, metrics are cumulative
+        for name in (
+            "query_requests",
+            "query_duration",
+            "llm_calls",
+            "llm_latency",
+            "llm_tokens_used",
+            "sql_rejected",
+            "sql_generation_duration",
+            "sql_validation_failures",
+            "database_errors",
+            "circuit_breaker_state",
+            "rate_limiter_active",
+            "db_connections_active",
+            "db_query_duration",
+            "schema_cache_age",
+        ):
+            collector = getattr(self, name, None)
+            if collector is not None:
+                with contextlib.suppress(KeyError):
+                    REGISTRY.unregister(collector)
         self._initialize_metrics()
+
+    @classmethod
+    def reset(cls) -> None:
+        """Reset the singleton collector's metrics (test isolation helper)."""
+        instance = cls()
+        instance.reset_all_metrics()
 
 
 # Singleton instance

@@ -167,6 +167,20 @@ class ResilienceConfig(BaseSettings):
         default=60.0, ge=10.0, le=300.0, description="Circuit breaker timeout in seconds"
     )
 
+    # Concurrency rate limiting (wired into the orchestrator request path)
+    rate_limit_query: int = Field(
+        default=10, ge=1, le=1000, description="Maximum concurrent queries"
+    )
+    rate_limit_llm: int = Field(
+        default=5, ge=1, le=1000, description="Maximum concurrent LLM API calls"
+    )
+    rate_limit_acquire_timeout: float = Field(
+        default=5.0,
+        ge=0.1,
+        le=60.0,
+        description="Seconds to wait for a rate limiter slot before rejecting",
+    )
+
 
 class ObservabilityConfig(BaseSettings):
     """Observability and monitoring configuration."""

@@ -64,7 +64,7 @@ class TestDatabaseResolution:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools=mock_pools,
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -91,7 +91,7 @@ class TestDatabaseResolution:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"only_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -117,7 +117,7 @@ class TestDatabaseResolution:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -175,7 +175,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=3),
+            resilience_config=ResilienceConfig(max_retries=3, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -220,7 +220,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=3),
+            resilience_config=ResilienceConfig(max_retries=3, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -261,7 +261,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=2),
+            resilience_config=ResilienceConfig(max_retries=2, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -356,7 +356,7 @@ class TestResultValidation:
             result_validator=mock_validator,
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(enabled=True),
         )
 
@@ -383,7 +383,7 @@ class TestResultValidation:
             result_validator=mock_validator,
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(enabled=False),
         )
 
@@ -411,7 +411,7 @@ class TestResultValidation:
             result_validator=mock_validator,
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(enabled=True),
         )
 
@@ -478,7 +478,7 @@ class TestExecuteQueryFlow:
             result_validator=MagicMock(),
             schema_cache=mock_cache,
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -536,7 +536,7 @@ class TestExecuteQueryFlow:
             result_validator=mock_result_validator,
             schema_cache=mock_cache,
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(enabled=True),
         )
 
@@ -588,7 +588,7 @@ class TestExecuteQueryFlow:
             result_validator=MagicMock(),
             schema_cache=mock_cache,
             pools={"test_db": mock_pool},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -619,7 +619,7 @@ class TestExecuteQueryFlow:
             result_validator=MagicMock(),
             schema_cache=mock_cache,
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -705,7 +705,7 @@ class TestExecuteQueryFlow:
             result_validator=MagicMock(),
             schema_cache=mock_cache,
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -737,7 +737,7 @@ class TestExecuteQueryFlow:
             result_validator=MagicMock(),
             schema_cache=mock_cache,
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -776,7 +776,7 @@ class TestExecuteQueryFlow:
             result_validator=MagicMock(),
             schema_cache=mock_cache,
             pools={"only_db": MagicMock()},  # Only one database
-            resilience_config=ResilienceConfig(),
+            resilience_config=ResilienceConfig(retry_delay=0.1),  # fast backoff
             validation_config=ValidationConfig(),
         )
 
@@ -805,7 +805,7 @@ class TestQuestionLengthLimit:
             "result_validator": MagicMock(),
             "schema_cache": MagicMock(),
             "pools": {"test_db": MagicMock()},
-            "resilience_config": ResilienceConfig(),
+            "resilience_config": ResilienceConfig(retry_delay=0.1),  # keep retry tests fast
             "validation_config": ValidationConfig(),
         }
         kwargs.update(overrides)

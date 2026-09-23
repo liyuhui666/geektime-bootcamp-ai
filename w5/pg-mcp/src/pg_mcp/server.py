@@ -18,7 +18,7 @@ from pg_mcp.db.pool import close_pools, create_pool
 from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
-from pg_mcp.resilience.circuit_breaker import CircuitBreaker
+from pg_mcp.observability.tracing import request_context
 from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.orchestrator import QueryOrchestrator
 from pg_mcp.services.result_validator import ResultValidator
@@ -34,7 +34,6 @@ _pools: dict[str, Pool] | None = None
 _schema_cache: SchemaCache | None = None
 _orchestrator: QueryOrchestrator | None = None
 _metrics: MetricsCollector | None = None
-_circuit_breaker: CircuitBreaker | None = None
 _rate_limiter: MultiRateLimiter | None = None
 
 
@@ -69,7 +68,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         ...     pass
     """
     global _settings, _pools, _schema_cache, _orchestrator, _metrics
-    global _circuit_breaker, _rate_limiter
+    global _rate_limiter
 
     logger.info("Starting PostgreSQL MCP Server initialization...")
 
@@ -164,6 +163,8 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
                 pool=pool,
                 security_config=_settings.security,
                 db_config=_settings.database,
+                database_name=db_name,
+                metrics=_metrics,
             )
             sql_executors[db_name] = executor
             logger.info(f"Created SQL executor for database '{db_name}'")
@@ -177,16 +178,12 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # 7. Initialize resilience components
         logger.info("Initializing resilience components...")
 
-        # Circuit Breaker for LLM calls
-        _circuit_breaker = CircuitBreaker(
-            failure_threshold=_settings.resilience.circuit_breaker_threshold,
-            recovery_timeout=_settings.resilience.circuit_breaker_timeout,
-        )
-
-        # Rate Limiter
+        # Rate limiter: query slots cover the whole pipeline; LLM slots cover
+        # both LLM call sites (generation + result validation). The circuit
+        # breaker lives inside the orchestrator.
         _rate_limiter = MultiRateLimiter(
-            query_limit=10,  # Can be made configurable
-            llm_limit=5,  # Can be made configurable
+            query_limit=_settings.resilience.rate_limit_query,
+            llm_limit=_settings.resilience.rate_limit_llm,
         )
 
         # 8. Create QueryOrchestrator
@@ -200,6 +197,8 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             pools=_pools,
             resilience_config=_settings.resilience,
             validation_config=_settings.validation,
+            rate_limiter=_rate_limiter,
+            metrics=_metrics,
         )
 
         logger.info("PostgreSQL MCP Server initialization complete!")
@@ -350,9 +349,15 @@ async def query(
             },
         }
 
-    # Execute query through orchestrator
+    # Execute query through orchestrator. The tracing context assigns the
+    # request id; the orchestrator reuses it for all downstream log lines.
     try:
-        response: QueryResponse = await _orchestrator.execute_query(request)
+        async with request_context() as request_id:
+            logger.info(
+                "Query tool invoked",
+                extra={"request_id": request_id, "question": question[:100]},
+            )
+            response: QueryResponse = await _orchestrator.execute_query(request)
         # to_dict always includes tokens_used (0 when no LLM call succeeded)
         return response.to_dict()
     except Exception as e:

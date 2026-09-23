@@ -80,10 +80,12 @@ def build_user_prompt(
         parts.append(context)
         parts.append("")
 
-    # If this is a retry, include previous attempt and error
-    if previous_attempt and error_feedback:
+    # If this is a retry, include error feedback (and the previous SQL when
+    # available — extraction failures have no SQL text to show)
+    if error_feedback:
         parts.append("## Previous Attempt (Failed):")
-        parts.append(f"```sql\n{previous_attempt}\n```")
+        if previous_attempt:
+            parts.append(f"```sql\n{previous_attempt}\n```")
         parts.append(f"Error: {error_feedback}")
         parts.append("Please fix the issue and generate a correct query.")
         parts.append("")

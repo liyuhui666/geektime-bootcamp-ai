@@ -465,27 +465,46 @@ curl http://localhost:9090/metrics
 
 **可用指标：**
 
-- `pg_mcp_queries_total` - 已处理的总查询数
-- `pg_mcp_query_duration_seconds` - 查询执行时间直方图
-- `pg_mcp_sql_generation_duration_seconds` - SQL 生成时间
-- `pg_mcp_sql_validation_failures_total` - 验证失败次数
-- `pg_mcp_database_errors_total` - 数据库错误数
-- `pg_mcp_llm_tokens_used_total` - LLM token 使用总数
+| 指标名 | 类型 | 标签 | 说明 |
+|--------|------|------|------|
+| `pg_mcp_query_requests_total` | Counter | `status`, `database` | 已处理的查询总数（status: success / error / validation_failed / rate_limit_exceeded 等） |
+| `pg_mcp_query_duration_seconds` | Histogram | - | 单次查询请求全流程耗时 |
+| `pg_mcp_sql_generation_duration_seconds` | Histogram | `attempt` | 单次 LLM SQL 生成调用耗时（按尝试次数区分） |
+| `pg_mcp_sql_validation_failures_total` | Counter | `reason` | 重试循环内 SQL 校验失败次数（reason: security / parse） |
+| `pg_mcp_llm_calls_total` | Counter | `operation`, `status` | LLM API 调用数（operation: generation / validation；status: success / error） |
+| `pg_mcp_llm_latency_seconds` | Histogram | `operation` | LLM API 调用延迟 |
+| `pg_mcp_llm_tokens_used_total` | Counter | `operation` | LLM token 消耗总量 |
+| `pg_mcp_database_errors_total` | Counter | `database`, `sqlstate_class` | 数据库错误数（按 SQLSTATE 类码前两位分类） |
+| `pg_mcp_circuit_breaker_state` | Gauge | - | 熔断器状态（0=closed, 1=half_open, 2=open） |
+| `pg_mcp_rate_limiter_active` | Gauge | `type` | 当前占用的限流槽位（type: queries / llm） |
+| `pg_mcp_sql_rejected_total` | Counter | `reason` | 安全检查拒绝的 SQL 数 |
+| `pg_mcp_db_connections_active` | Gauge | `database` | 活跃数据库连接数 |
+| `pg_mcp_db_query_duration_seconds` | Histogram | - | SQL 执行耗时 |
+| `pg_mcp_schema_cache_age_seconds` | Gauge | `database` | Schema 缓存年龄 |
 
 ### 日志
 
-结构化 JSON 日志（或文本格式）输出到标准输出：
+结构化 JSON 日志（或文本格式）输出到 **stderr**（stdout 保留给 MCP stdio 协议）：
 
 ```json
 {
   "timestamp": "2025-12-20T10:30:00.123Z",
   "level": "INFO",
   "message": "Query executed successfully",
+  "request_id": "a1b2c3d4-...",
   "database": "mydb",
   "execution_time": 0.023,
   "row_count": 42
 }
 ```
+
+每次请求由 `request_context()` 分配 `request_id`，链路上所有日志行携带同一 ID，便于端到端排查。
+
+### 疑难排查
+
+- **高峰期收到 `rate_limit_exceeded`**：查询槽位（`RESILIENCE_RATE_LIMIT_QUERY`）覆盖整条流水线。LLM 重试期间（含退避等待）请求仍持有槽位，慢请求会占住并发额度。可调大查询槽位、调小 `RESILIENCE_MAX_RETRIES`，或调低 `RESILIENCE_RATE_LIMIT_ACQUIRE_TIMEOUT` 让调用方更快拿到明确拒绝而非长时间排队。
+- **LLM 频繁 429**：降低 `RESILIENCE_RATE_LIMIT_LLM`（生成与结果校验共享 LLM 槽位），退避重试会自动处理瞬时限流。
+- **熔断器打开（`pg_mcp_circuit_breaker_state` = 2）**：LLM 连续失败达到阈值，后续请求快速失败；`RESILIENCE_CIRCUIT_BREAKER_TIMEOUT` 秒后进入 half_open 试探恢复。
 
 ## 故障排查
 

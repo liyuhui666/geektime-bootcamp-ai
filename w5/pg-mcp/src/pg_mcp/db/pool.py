@@ -79,7 +79,7 @@ async def create_pools(configs: list[DatabaseConfig]) -> dict[str, Pool]:
     return pools
 
 
-async def close_pools(pools: dict[str, Pool], timeout: float = 10.0) -> None:
+async def close_pools(pools: dict[str, Pool], timeout: float = 10.0) -> None:  # noqa: ASYNC109
     """Close all connection pools gracefully.
 
     This function closes all pools and waits for all connections to be

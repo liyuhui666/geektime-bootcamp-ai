@@ -124,6 +124,12 @@ def trace_async(
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
     """Decorator to trace async functions with request ID.
 
+    .. deprecated::
+        Do not use in new code. This implementation swaps the *global* log
+        record factory at every call, which races under concurrency (one
+        request restores another's factory). Use ``request_context()`` +
+        ``get_request_id()`` instead; this decorator will be removed in v0.4.
+
     Automatically injects request_id into log records and ensures
     context propagation through async calls.
 

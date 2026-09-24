@@ -100,6 +100,30 @@ uv run python -m pg_mcp
 python -m pg_mcp
 ```
 
+#### 远程模式（HTTP）
+
+默认 stdio 只服务启动它的本地客户端。供其他机器调用时切换为 streamable-HTTP 传输：
+
+```bash
+# 本机监听（默认 127.0.0.1）
+MCP_TRANSPORT=http MCP_HTTP_PORT=8000 MCP_HTTP_TOKEN=change-me uv run python -m pg_mcp
+
+# 供其他服务器访问：显式绑定所有网卡，并务必设置 token
+MCP_TRANSPORT=http MCP_HTTP_HOST=0.0.0.0 MCP_HTTP_PORT=8000 MCP_HTTP_TOKEN=change-me \
+  uv run python -m pg_mcp
+```
+
+| 变量             | 描述                                                | 默认值    |
+|------------------|-----------------------------------------------------|-----------|
+| `MCP_TRANSPORT`  | 传输方式：`stdio`（默认）或 `http`                  | `stdio`   |
+| `MCP_HTTP_HOST`  | HTTP 绑定地址（远程访问需显式设 `0.0.0.0`）         | `127.0.0.1` |
+| `MCP_HTTP_PORT`  | HTTP 端口                                           | `8000`    |
+| `MCP_HTTP_TOKEN` | Bearer token；请求须带 `Authorization: Bearer <token>` 头，无法设置自定义头的客户端可在 URL 后拼 `?access_token=<token>`；缺失或不匹配返回 401 | 空（关闭鉴权） |
+
+远程客户端连接地址为 `http://<服务器IP>:<端口>/mcp`（streamable-HTTP 类型）。公网或跨网段暴露时必须设置 `MCP_HTTP_TOKEN`。
+
+> 启动性能：schema 内省使用集合式查询（与表数量无关的固定 8 条查询），并在后台异步加载——传输层先就绪、`initialize` 立即应答，schema 就绪前到达的查询会按需回源加载。
+
 #### 与 Claude Desktop 集成
 
 添加以下配置到 Claude Desktop MCP 设置文件：
@@ -330,6 +354,7 @@ MULTIDB_DEFAULT_DATABASE=appdb
 | 变量                 | 描述                    | 默认值         |
 |----------------------|-------------------------|----------------|
 | `OPENAI_API_KEY`     | OpenAI API 密钥         | 必需           |
+| `OPENAI_BASE_URL`    | OpenAI 兼容网关地址（如内网 LLM 代理），留空使用官方端点 | 空 |
 | `OPENAI_MODEL`       | 使用的模型              | `gpt-5.2-mini` |
 | `OPENAI_MAX_TOKENS`  | 每次请求的最大 token 数 | `32000`        |
 | `OPENAI_TEMPERATURE` | 模型温度                | `0.0`          |

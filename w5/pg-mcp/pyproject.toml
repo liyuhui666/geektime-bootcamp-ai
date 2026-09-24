@@ -9,9 +9,14 @@ dependencies = [
     "sqlglot>=28.5.0",
     "pydantic>=2.12.0",
     "pydantic-settings>=2.12.0",
+    "python-dotenv>=1.0.0",
     "openai>=2.14.0",
     "prometheus-client>=0.23.0",
-    "fastmcp>=2.14.1",
+    # Official MCP SDK (mcp.server.fastmcp). Do NOT confuse with the
+    # third-party "fastmcp" package - the code imports only the official one.
+    "mcp>=1.17.0,<2",
+    "starlette>=0.27.0",
+    "uvicorn>=0.23.0",
 ]
 
 [project.optional-dependencies]

@@ -49,6 +49,10 @@ class OpenAIConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENAI_")
 
     api_key: SecretStr = Field(default=SecretStr(""), description="OpenAI API key")
+    base_url: str | None = Field(
+        default=None,
+        description="Optional OpenAI-compatible API base URL (e.g. internal LLM gateway)",
+    )
     model: str = Field(default="gpt-4o-mini", description="Model to use for SQL generation")
     max_tokens: int = Field(
         default=2000, ge=100, le=32768, description="Maximum tokens in response"

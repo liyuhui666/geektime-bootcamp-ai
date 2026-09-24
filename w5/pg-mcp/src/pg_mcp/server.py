@@ -5,11 +5,13 @@ functionality as an MCP tool. It includes complete lifespan management for
 initializing and cleaning up all components.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import Settings
@@ -33,6 +35,9 @@ _schema_cache: SchemaCache | None = None
 _orchestrator: QueryOrchestrator | None = None
 _metrics: MetricsCollector | None = None
 _rate_limiter: MultiRateLimiter | None = None
+# Whether the heavy init below already ran in this process. HTTP mode runs
+# it once at app startup; per-session lifespan entries then become no-ops.
+_lifespan_initialized = False
 
 
 @asynccontextmanager
@@ -66,7 +71,20 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         ...     pass
     """
     global _settings, _runtimes, _schema_cache, _orchestrator, _metrics
-    global _rate_limiter
+    global _rate_limiter, _lifespan_initialized
+
+    # Background schema loaders; cancelled on shutdown if still running.
+    schema_load_tasks: list[asyncio.Task[None]] = []
+
+    # The official SDK's HTTP transport enters this lifespan per client
+    # session (lowlevel Server.run), not once per process. All init below
+    # is process-global (settings, pools, orchestrator), so only the first
+    # entry does the work; later sessions reuse it. Doing it again would
+    # stack another pool per reconnect until PostgreSQL hits max_connections.
+    if _lifespan_initialized:
+        logger.info("Reusing already-initialized server components")
+        yield
+        return
 
     logger.info("Starting PostgreSQL MCP Server initialization...")
 
@@ -97,19 +115,31 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         logger.info("Creating database runtimes...")
         _runtimes = await DatabaseManager.build(_settings)
 
-        # 4. Load Schema cache
+        # 4. Load Schema cache in the background. Introspection can take a
+        # while on wide databases; blocking startup on it delays the MCP
+        # initialize handshake past clients' request timeouts (e.g. 60s).
+        # The orchestrator falls back to on-demand loading if a query
+        # arrives before the background load finishes.
         logger.info("Initializing schema cache...")
         _schema_cache = SchemaCache(_settings.cache)
 
+        async def _load_schema_in_background(rt: DatabaseRuntime) -> None:
+            logger.info(f"Loading schema for database '{rt.name}' (background)...")
+            try:
+                schema = await _schema_cache.load(rt.name, rt.pool)
+                logger.info(
+                    f"Schema loaded for '{rt.name}'",
+                    extra={
+                        "tables": len(schema.tables),
+                    },
+                )
+            except Exception as e:
+                # Startup continues; the orchestrator retries on demand and
+                # surfaces a clean error if the database is unreachable.
+                logger.error(f"Background schema load failed for '{rt.name}': {e!s}")
+
         for rt in _runtimes.values():
-            logger.info(f"Loading schema for database '{rt.name}'...")
-            schema = await _schema_cache.load(rt.name, rt.pool)
-            logger.info(
-                f"Schema loaded for '{rt.name}'",
-                extra={
-                    "tables": len(schema.tables),
-                },
-            )
+            schema_load_tasks.append(asyncio.create_task(_load_schema_in_background(rt)))
 
         # Optional: Start schema auto-refresh
         # Disabled by default to avoid unnecessary background tasks
@@ -180,18 +210,30 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             },
         )
 
-        # Yield to run the server
+        # Yield to run the server. _lifespan_initialized marks that the
+        # first (owning) session completed setup; if THIS session crashes,
+        # later sessions must still be able to re-run full init, so the
+        # flag is cleared on the way out.
+        _lifespan_initialized = True
+
         yield
 
     finally:
-        # Shutdown sequence
-        logger.info("Starting PostgreSQL MCP Server shutdown...")
+        # Full teardown when the owning session exits (transport shutting
+        # down) or crashes - see "Cleaning up crashed session" in logs.
+        # Clearing the flag lets a later session re-run full init.
+        _lifespan_initialized = False
+
+        # Cancel schema loads still running in the background (they hold
+        # pool connections that are about to be closed).
+        if schema_load_tasks:
+            for task in schema_load_tasks:
+                task.cancel()
+            await asyncio.gather(*schema_load_tasks, return_exceptions=True)
 
         # Stop schema auto-refresh with timeout
         if _schema_cache is not None:
             try:
-                import asyncio
-
                 await asyncio.wait_for(_schema_cache.stop_auto_refresh(), timeout=3.0)
                 logger.info("Schema auto-refresh stopped")
             except TimeoutError:
@@ -211,8 +253,21 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         logger.info("PostgreSQL MCP Server shutdown complete")
 
 
-# Create FastMCP server instance with lifespan
-mcp = FastMCP("pg-mcp", lifespan=lifespan)
+# Create FastMCP server instance with lifespan.
+#
+# Host-header note: FastMCP auto-enables DNS-rebinding protection only when
+# constructed with host in ("127.0.0.1", "localhost", "::1") - the default
+# host. The allowed_hosts list is then fixed to those loopback names, so any
+# request whose Host header carries a real IP or hostname (e.g. a remote
+# client hitting http://10.x.x.x:8000/mcp) is rejected with 421 before auth
+# even runs. We bind 0.0.0.0 for remote access at the uvicorn layer, so we
+# explicitly disable that protection here; remote abuse is handled by the
+# bearer-token middleware in __main__ instead.
+mcp = FastMCP(
+    "pg-mcp",
+    lifespan=lifespan,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 @mcp.tool()

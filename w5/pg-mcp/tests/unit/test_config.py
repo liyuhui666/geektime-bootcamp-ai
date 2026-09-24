@@ -155,6 +155,16 @@ class TestOpenAIConfig:
         with pytest.raises(ValidationError):
             OpenAIConfig(api_key="sk-test", temperature=2.1)
 
+    def test_base_url_default_none(self) -> None:
+        """Test base_url defaults to None (official OpenAI endpoint)."""
+        config = OpenAIConfig(api_key="sk-test123")
+        assert config.base_url is None
+
+    def test_base_url_custom_gateway(self) -> None:
+        """Test base_url accepts an OpenAI-compatible gateway URL."""
+        config = OpenAIConfig(api_key="sk-test123", base_url="http://llm-gateway.internal:3030/v1")
+        assert config.base_url == "http://llm-gateway.internal:3030/v1"
+
 
 class TestSecurityConfig:
     """Tests for SecurityConfig."""

@@ -3,7 +3,15 @@
 This module provides functionality to introspect PostgreSQL database schemas,
 extracting comprehensive metadata about tables, columns, constraints, indexes,
 and custom types.
+
+Performance note: all metadata is fetched with a fixed number of set-based
+catalog queries (one query per metadata kind, covering every user table at
+once). Never reintroduce per-table/per-column round trips here - on a wide
+database the serial round trips add up to minutes and block server startup
+past MCP clients' initialize timeouts.
 """
+
+from collections import defaultdict
 
 from asyncpg import Pool
 from asyncpg.connection import Connection
@@ -16,6 +24,9 @@ from pg_mcp.models.schema import (
     IndexInfo,
     TableInfo,
 )
+
+# Key used by the batch loaders below: (schema_name, table_name).
+TableKey = tuple[str, str]
 
 
 class SchemaIntrospector:
@@ -43,7 +54,8 @@ class SchemaIntrospector:
         """Execute complete schema introspection.
 
         This method fetches all schema metadata including tables, views,
-        columns, constraints, indexes, and custom types.
+        columns, constraints, indexes, and custom types using a fixed
+        number of set-based queries regardless of table count.
 
         Returns:
             DatabaseSchema: Complete database schema information.
@@ -58,34 +70,33 @@ class SchemaIntrospector:
             version_result = await conn.fetchval("SELECT version()")
             version = version_result.split(",")[0] if version_result else None
 
-            # Fetch all schema components concurrently
             tables = await self._get_tables(conn)
             views = await self._get_views(conn)
             enum_types = await self._get_enum_types(conn)
 
-            # Enrich tables with detailed information
-            for table in tables + views:
-                table.columns = await self._get_columns(conn, table.table_name, table.schema_name)
-                primary_keys = await self._get_primary_keys(
-                    conn, table.table_name, table.schema_name
-                )
+            # Batch-load per-table metadata (one query per kind, all tables
+            # at once), then attach it in memory.
+            all_tables = tables + views
+            columns = await self._get_all_columns(conn)
+            primary_keys = await self._get_all_primary_keys(conn)
+            foreign_keys = await self._get_all_foreign_keys(conn)
+            indexes = await self._get_all_indexes(conn)
+            row_counts = await self._get_all_row_count_estimates(conn)
 
-                # Mark primary key columns
+            for table in all_tables:
+                key = (table.schema_name, table.table_name)
+                table.columns = columns.get(key, [])
+                primary_key_columns = primary_keys.get(key, set())
                 for col in table.columns:
-                    if col.name in primary_keys:
+                    if col.name in primary_key_columns:
                         col.is_primary_key = True
-
-                table.foreign_keys = await self._get_foreign_keys(
-                    conn, table.table_name, table.schema_name
-                )
-                table.indexes = await self._get_indexes(conn, table.table_name, table.schema_name)
-                table.row_count_estimate = await self._get_row_count_estimate(
-                    conn, table.table_name, table.schema_name
-                )
+                table.foreign_keys = foreign_keys.get(key, [])
+                table.indexes = indexes.get(key, [])
+                table.row_count_estimate = row_counts.get(key, 0)
 
             return DatabaseSchema(
                 database_name=self.database_name,
-                tables=tables + views,
+                tables=all_tables,
                 enum_types=enum_types,
                 version=version,
             )
@@ -123,133 +134,99 @@ class SchemaIntrospector:
             for row in rows
         ]
 
-    async def _get_columns(
-        self, conn: Connection, table_name: str, schema_name: str
-    ) -> list[ColumnInfo]:
-        """Get column information for a specific table.
+    async def _get_all_columns(self, conn: Connection) -> dict[TableKey, list[ColumnInfo]]:
+        """Get column metadata for every user table/view in one query.
+
+        Uniqueness is resolved in the same query (EXISTS against unique
+        constraints), so no per-column round trip is needed.
 
         Args:
             conn: Database connection.
-            table_name: Name of the table.
-            schema_name: Schema name.
 
         Returns:
-            list[ColumnInfo]: List of column information objects.
+            dict: (schema_name, table_name) -> columns ordered by attnum.
         """
         query = """
             SELECT
+                n.nspname AS schema_name,
+                c.relname AS table_name,
                 a.attname AS column_name,
                 pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
                 NOT a.attnotnull AS is_nullable,
                 pg_get_expr(ad.adbin, ad.adrelid) AS default_value,
-                col_description(a.attrelid, a.attnum) AS comment
+                col_description(a.attrelid, a.attnum) AS comment,
+                EXISTS(
+                    SELECT 1
+                    FROM pg_constraint con
+                    WHERE con.conrelid = c.oid
+                      AND con.contype = 'u'  -- unique constraint (PKs are 'p')
+                      AND a.attnum = ANY(con.conkey)
+                ) AS is_unique
             FROM pg_attribute a
             JOIN pg_class c ON a.attrelid = c.oid
             JOIN pg_namespace n ON c.relnamespace = n.oid
             LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-            WHERE c.relname = $1
-              AND n.nspname = $2
+            WHERE c.relkind IN ('r', 'v')  -- tables and views
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
               AND a.attnum > 0
               AND NOT a.attisdropped
-            ORDER BY a.attnum
+            ORDER BY n.nspname, c.relname, a.attnum
         """
 
-        rows = await conn.fetch(query, table_name, schema_name)
-
-        columns = []
-        for row in rows:
-            # Check if column has unique constraint
-            is_unique = await self._is_column_unique(
-                conn, table_name, schema_name, row["column_name"]
-            )
-
-            columns.append(
+        columns: dict[TableKey, list[ColumnInfo]] = defaultdict(list)
+        for row in await conn.fetch(query):
+            columns[(row["schema_name"], row["table_name"])].append(
                 ColumnInfo(
                     name=row["column_name"],
                     data_type=row["data_type"],
                     is_nullable=row["is_nullable"],
                     default_value=row["default_value"],
-                    is_unique=is_unique,
+                    is_unique=row["is_unique"],
                     comment=row["comment"],
                 )
             )
+        return dict(columns)
 
-        return columns
-
-    async def _is_column_unique(
-        self, conn: Connection, table_name: str, schema_name: str, column_name: str
-    ) -> bool:
-        """Check if a column has a unique constraint (excluding primary key).
+    async def _get_all_primary_keys(self, conn: Connection) -> dict[TableKey, set[str]]:
+        """Get primary key column names for every user table in one query.
 
         Args:
             conn: Database connection.
-            table_name: Name of the table.
-            schema_name: Schema name.
-            column_name: Name of the column.
 
         Returns:
-            bool: True if column has a unique constraint.
+            dict: (schema_name, table_name) -> set of PK column names.
         """
         query = """
-            SELECT EXISTS(
-                SELECT 1
-                FROM pg_constraint con
-                JOIN pg_class c ON con.conrelid = c.oid
-                JOIN pg_namespace n ON c.relnamespace = n.oid
-                JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(con.conkey)
-                WHERE c.relname = $1
-                  AND n.nspname = $2
-                  AND a.attname = $3
-                  AND con.contype = 'u'  -- unique constraint
-            )
-        """
-
-        result = await conn.fetchval(query, table_name, schema_name, column_name)
-        return bool(result) if result is not None else False
-
-    async def _get_primary_keys(
-        self, conn: Connection, table_name: str, schema_name: str
-    ) -> list[str]:
-        """Get primary key column names for a table.
-
-        Args:
-            conn: Database connection.
-            table_name: Name of the table.
-            schema_name: Schema name.
-
-        Returns:
-            list[str]: List of primary key column names.
-        """
-        query = """
-            SELECT a.attname AS column_name
+            SELECT
+                n.nspname AS schema_name,
+                c.relname AS table_name,
+                a.attname AS column_name
             FROM pg_index i
             JOIN pg_class c ON i.indrelid = c.oid
             JOIN pg_namespace n ON c.relnamespace = n.oid
             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
-            WHERE c.relname = $1
-              AND n.nspname = $2
-              AND i.indisprimary
-            ORDER BY array_position(i.indkey, a.attnum)
+            WHERE i.indisprimary
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
         """
 
-        rows = await conn.fetch(query, table_name, schema_name)
-        return [row["column_name"] for row in rows]
+        primary_keys: dict[TableKey, set[str]] = defaultdict(set)
+        for row in await conn.fetch(query):
+            primary_keys[(row["schema_name"], row["table_name"])].add(row["column_name"])
+        return dict(primary_keys)
 
-    async def _get_foreign_keys(
-        self, conn: Connection, table_name: str, schema_name: str
-    ) -> list[ForeignKeyInfo]:
-        """Get foreign key relationships for a table.
+    async def _get_all_foreign_keys(self, conn: Connection) -> dict[TableKey, list[ForeignKeyInfo]]:
+        """Get foreign key relationships for every user table in one query.
 
         Args:
             conn: Database connection.
-            table_name: Name of the table.
-            schema_name: Schema name.
 
         Returns:
-            list[ForeignKeyInfo]: List of foreign key information objects.
+            dict: (schema_name, table_name) -> list of ForeignKeyInfo.
         """
         query = """
             SELECT
+                n.nspname AS schema_name,
+                c.relname AS table_name,
                 con.conname AS constraint_name,
                 a.attname AS column_name,
                 ref_c.relname AS referenced_table,
@@ -263,39 +240,36 @@ class SchemaIntrospector:
             JOIN pg_attribute ref_a
                 ON ref_a.attrelid = ref_c.oid
                 AND ref_a.attnum = ANY(con.confkey)
-            WHERE c.relname = $1
-              AND n.nspname = $2
-              AND con.contype = 'f'  -- foreign key
-            ORDER BY con.conname
+            WHERE con.contype = 'f'  -- foreign key
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+            ORDER BY n.nspname, c.relname, con.conname
         """
 
-        rows = await conn.fetch(query, table_name, schema_name)
-
-        return [
-            ForeignKeyInfo(
-                constraint_name=row["constraint_name"],
-                column_name=row["column_name"],
-                referenced_table=row["referenced_table"],
-                referenced_column=row["referenced_column"],
+        foreign_keys: dict[TableKey, list[ForeignKeyInfo]] = defaultdict(list)
+        for row in await conn.fetch(query):
+            foreign_keys[(row["schema_name"], row["table_name"])].append(
+                ForeignKeyInfo(
+                    constraint_name=row["constraint_name"],
+                    column_name=row["column_name"],
+                    referenced_table=row["referenced_table"],
+                    referenced_column=row["referenced_column"],
+                )
             )
-            for row in rows
-        ]
+        return dict(foreign_keys)
 
-    async def _get_indexes(
-        self, conn: Connection, table_name: str, schema_name: str
-    ) -> list[IndexInfo]:
-        """Get index information for a table.
+    async def _get_all_indexes(self, conn: Connection) -> dict[TableKey, list[IndexInfo]]:
+        """Get index information for every user table in one query.
 
         Args:
             conn: Database connection.
-            table_name: Name of the table.
-            schema_name: Schema name.
 
         Returns:
-            list[IndexInfo]: List of index information objects.
+            dict: (schema_name, table_name) -> list of IndexInfo.
         """
         query = """
             SELECT
+                n.nspname AS schema_name,
+                c.relname AS table_name,
                 i.relname AS index_name,
                 idx.indisunique AS is_unique,
                 am.amname AS index_type,
@@ -311,23 +285,22 @@ class SchemaIntrospector:
             JOIN pg_class c ON c.oid = idx.indrelid
             JOIN pg_namespace n ON c.relnamespace = n.oid
             JOIN pg_am am ON i.relam = am.oid
-            WHERE c.relname = $1
-              AND n.nspname = $2
-              AND NOT idx.indisprimary  -- exclude primary key indexes
-            ORDER BY i.relname
+            WHERE NOT idx.indisprimary  -- exclude primary key indexes
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+            ORDER BY n.nspname, c.relname, i.relname
         """
 
-        rows = await conn.fetch(query, table_name, schema_name)
-
-        return [
-            IndexInfo(
-                name=row["index_name"],
-                columns=list(row["columns"]),
-                is_unique=row["is_unique"],
-                index_type=row["index_type"],
+        indexes: dict[TableKey, list[IndexInfo]] = defaultdict(list)
+        for row in await conn.fetch(query):
+            indexes[(row["schema_name"], row["table_name"])].append(
+                IndexInfo(
+                    name=row["index_name"],
+                    columns=list(row["columns"]),
+                    is_unique=row["is_unique"],
+                    index_type=row["index_type"],
+                )
             )
-            for row in rows
-        ]
+        return dict(indexes)
 
     async def _get_views(self, conn: Connection) -> list[TableInfo]:
         """Get all user views.
@@ -399,29 +372,30 @@ class SchemaIntrospector:
             for row in rows
         ]
 
-    async def _get_row_count_estimate(
-        self, conn: Connection, table_name: str, schema_name: str
-    ) -> int:
-        """Get estimated row count for a table.
+    async def _get_all_row_count_estimates(self, conn: Connection) -> dict[TableKey, int]:
+        """Get estimated row counts for every user table/view in one query.
 
-        This uses PostgreSQL's statistics rather than COUNT(*) for better
-        performance on large tables.
+        Uses PostgreSQL's statistics (reltuples) rather than COUNT(*).
+        Negative estimates (never analyzed) are clamped to 0.
 
         Args:
             conn: Database connection.
-            table_name: Name of the table.
-            schema_name: Schema name.
 
         Returns:
-            int: Estimated number of rows.
+            dict: (schema_name, table_name) -> estimated row count.
         """
         query = """
-            SELECT reltuples::bigint AS estimate
+            SELECT
+                n.nspname AS schema_name,
+                c.relname AS table_name,
+                GREATEST(c.reltuples::bigint, 0) AS estimate
             FROM pg_class c
             JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE c.relname = $1
-              AND n.nspname = $2
+            WHERE c.relkind IN ('r', 'v')  -- tables and views
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
         """
 
-        result = await conn.fetchval(query, table_name, schema_name)
-        return int(result) if result is not None else 0
+        estimates: dict[TableKey, int] = {}
+        for row in await conn.fetch(query):
+            estimates[(row["schema_name"], row["table_name"])] = int(row["estimate"])
+        return estimates
